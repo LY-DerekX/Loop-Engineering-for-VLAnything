@@ -12,9 +12,9 @@ It also includes separate LeRobot-side collection paths:
 
 - `rgb_record/`: RGB-only recording overlay using the official Hugging Face LeRobot repository.
 - `rgbd_record/`: Orbbec RGB-D recording overlay that can be copied into the official Hugging Face LeRobot repository.
-- `visuotactile_record/`: visuo-tactile (vision + touch) recording overlay, in progress.
+- `visuo-tactile_record/`: visuo-tactile (vision + touch) recording overlay, in progress.
 
-The official LeRobot project is here: https://github.com/huggingface/lerobot. The visuo-tactile data collection pipeline under `visuotactile_record/` is in progress, and its dataset and toolkit will be released open source when ready.
+The official LeRobot project is here: https://github.com/huggingface/lerobot. The visuo-tactile data collection pipeline under `visuo-tactile_record/` is in progress, and its dataset and toolkit will be released open source when ready.
 
 ## Dataset
 
