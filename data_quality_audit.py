@@ -4,8 +4,8 @@
 The policy is conservative:
   - objective, deterministic failures are marked drop
   - sampled content, distribution, and motion anomalies are marked review
-  - semantic task-success checks are reported as not checked unless a detector
-    or VLM module is added later
+  - semantic task-success checks are optional and run only when an evaluator
+    plugin is explicitly configured
 
 This script does not delete source data directly. Use the emitted keep/review/
 drop lists to build a cleaned dataset after review.
@@ -36,6 +36,16 @@ from utils.media_utils import (
     validate_png,
     video_content_metrics,
 )
+from utils.semantic_evaluator import (
+    SemanticEpisode,
+    SemanticEvaluator,
+    VideoSegment,
+    evaluator_name,
+    infer_failure_stage,
+    load_evaluator,
+    load_evaluator_config,
+    normalize_result,
+)
 from utils.quality_utils import (
     EpisodeQuality,
     build_episode_columns,
@@ -59,6 +69,8 @@ class AuditConfig:
     depth_sample_frames: int
     duplicate_check: str
     video_sample_stride: int
+    semantic_evaluator: SemanticEvaluator | None = None
+    semantic_review_threshold: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -624,6 +636,114 @@ def review_video_content_if_requested(
         audit.skip("video_content_not_checked")
 
 
+def semantic_tasks_for_episode(metadata: DatasetMetadata, data: pa.Table | None) -> tuple[str, ...]:
+    if data is None or "task_index" not in data.column_names:
+        return ()
+    if "task_index" not in metadata.tasks.column_names or "task" not in metadata.tasks.column_names:
+        return ()
+    task_map = {
+        int(index.as_py()): str(text.as_py())
+        for index, text in zip(metadata.tasks["task_index"], metadata.tasks["task"])
+    }
+    ordered: list[str] = []
+    for value in data["task_index"]:
+        text = task_map.get(int(value.as_py()))
+        if text is not None and text not in ordered:
+            ordered.append(text)
+    return tuple(ordered)
+
+
+def semantic_videos_for_episode(
+    config: AuditConfig,
+    metadata: DatasetMetadata,
+    record: EpisodeRecord,
+) -> tuple[VideoSegment, ...]:
+    videos: list[VideoSegment] = []
+    for video_key in metadata.video_keys:
+        chunk = int(metadata.episode_cols[f"videos/{video_key}/chunk_index"][record.row])
+        file_index = int(metadata.episode_cols[f"videos/{video_key}/file_index"][record.row])
+        from_timestamp = float(metadata.episode_cols[f"videos/{video_key}/from_timestamp"][record.row])
+        to_timestamp = float(metadata.episode_cols[f"videos/{video_key}/to_timestamp"][record.row])
+        videos.append(
+            VideoSegment(
+                key=video_key,
+                path=config.root / "videos" / video_key / f"chunk-{chunk:03d}" / f"file-{file_index:03d}.mp4",
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp,
+            )
+        )
+    return tuple(videos)
+
+
+def apply_semantic_evaluation(
+    config: AuditConfig,
+    metadata: DatasetMetadata,
+    record: EpisodeRecord,
+    data: pa.Table | None,
+    audit: EpisodeQuality,
+) -> None:
+    evaluator = config.semantic_evaluator
+    audit.structural_status = audit.status
+    if evaluator is None:
+        audit.skip("semantic_task_success_not_checked")
+        return
+
+    audit.semantic_evaluator = evaluator_name(evaluator)
+    if audit.status == "drop":
+        audit.semantic_status = "skipped_structural_drop"
+        audit.skip("semantic_skipped_structural_drop")
+        return
+
+    tasks = semantic_tasks_for_episode(metadata, data)
+    if not tasks:
+        audit.semantic_status = "error"
+        audit.review("semantic_task_text_missing_review")
+        return
+
+    episode = SemanticEpisode(
+        dataset_root=config.root,
+        episode_index=record.episode_index,
+        length=record.length,
+        tasks=tasks,
+        videos=semantic_videos_for_episode(config, metadata, record),
+    )
+    try:
+        result = normalize_result(evaluator.evaluate(episode))
+    except Exception as exc:
+        audit.semantic_status = "error"
+        audit.metrics["semantic_error"] = f"{type(exc).__name__}:{str(exc)[:500]}"
+        audit.review(f"semantic_evaluation_failed_review:{type(exc).__name__}")
+        return
+
+    audit.semantic_progress_curve = list(result.progress_curve)
+    audit.semantic_progress_final = result.final_progress
+    audit.semantic_success_probability = result.success_probability
+    audit.semantic_score = result.score
+    if result.details:
+        audit.metrics["semantic_details"] = result.details
+    if result.progress_curve:
+        audit.metrics["semantic_progress_peak"] = max(result.progress_curve)
+        audit.metrics["semantic_progress_points"] = len(result.progress_curve)
+
+    if result.score < config.semantic_review_threshold:
+        audit.semantic_status = "review"
+        audit.semantic_failure_stage = result.failure_stage or infer_failure_stage(result.progress_curve)
+        audit.review("semantic_low_score_review")
+    else:
+        audit.semantic_status = "pass"
+        audit.semantic_failure_stage = result.failure_stage or ""
+
+
+def refresh_structural_status(audits: list[EpisodeQuality]) -> None:
+    for audit in audits:
+        if audit.drop_reasons:
+            audit.structural_status = "drop"
+        elif any(not reason.startswith("semantic_") for reason in audit.review_reasons):
+            audit.structural_status = "review"
+        else:
+            audit.structural_status = "keep"
+
+
 def audit_episode(
     config: AuditConfig,
     metadata: DatasetMetadata,
@@ -641,7 +761,7 @@ def audit_episode(
         audit_numeric_data(data, metadata, record, audit, audit_state)
     audit_depth_sidecars(config, metadata, record, data, audit)
     audit_video_files(config, metadata, runtime, caches, record, audit)
-    audit.skip("semantic_task_success_not_checked")
+    apply_semantic_evaluation(config, metadata, record, data, audit)
     audit.skip("cup_detector_not_configured")
 
 
@@ -711,6 +831,17 @@ def build_summary(
         "sample_frames": config.sample_frames,
         "video_sample_stride": config.video_sample_stride,
         "duplicate_check": config.duplicate_check,
+        "semantic_evaluation": {
+            "enabled": config.semantic_evaluator is not None,
+            "evaluator": (
+                evaluator_name(config.semantic_evaluator) if config.semantic_evaluator is not None else None
+            ),
+            "review_threshold": config.semantic_review_threshold,
+            "pass": sum(a.semantic_status == "pass" for a in audits),
+            "review": sum(a.semantic_status == "review" for a in audits),
+            "errors": sum(a.semantic_status == "error" for a in audits),
+            "skipped": sum(a.semantic_status.startswith("skipped") for a in audits),
+        },
         "ffmpeg": runtime.ffmpeg_path,
         "ffprobe": runtime.ffprobe_path,
         "thresholds": {
@@ -761,6 +892,7 @@ def run_audit(config: AuditConfig) -> int:
 
     thresholds = apply_distribution_reviews(state.audits, state)
     apply_duplicate_reviews(state, config.duplicate_check)
+    refresh_structural_status(state.audits)
     summary = build_summary(config, metadata, runtime, state.audits, global_errors, thresholds)
     write_quality_outputs(config.out_dir, state.audits, summary)
     print_audit_summary(config, state.audits, summary)
@@ -777,8 +909,12 @@ def audit_dataset(
     depth_sample_frames: int,
     duplicate_check: str,
     video_sample_stride: int,
+    semantic_evaluator: SemanticEvaluator | None = None,
+    semantic_review_threshold: float = 0.5,
 ) -> int:
     """Run the quality audit; kept for compatibility with existing utility scripts."""
+    if not 0.0 <= semantic_review_threshold <= 1.0:
+        raise ValueError("semantic review threshold must be within [0, 1]")
     config = AuditConfig(
         root=root.resolve(),
         out_dir=out_dir,
@@ -789,6 +925,8 @@ def audit_dataset(
         depth_sample_frames=depth_sample_frames,
         duplicate_check=duplicate_check,
         video_sample_stride=video_sample_stride,
+        semantic_evaluator=semantic_evaluator,
+        semantic_review_threshold=semantic_review_threshold,
     )
     return run_audit(config)
 
@@ -804,9 +942,26 @@ def main() -> None:
     parser.add_argument("--video-sample-stride", type=int, default=300)
     parser.add_argument("--depth-sample-frames", type=int, default=8)
     parser.add_argument("--duplicate-check", choices=["none", "trajectory"], default="trajectory")
+    parser.add_argument(
+        "--semantic-evaluator",
+        default=None,
+        help="optional evaluator plugin using module:attribute syntax",
+    )
+    parser.add_argument(
+        "--semantic-config",
+        type=Path,
+        default=None,
+        help="optional JSON configuration passed to the evaluator plugin",
+    )
+    parser.add_argument("--semantic-review-threshold", type=float, default=0.5)
     args = parser.parse_args()
 
     out_dir = args.out_dir or default_audit_output_dir(args.dataset)
+    semantic_evaluator = (
+        load_evaluator(args.semantic_evaluator, load_evaluator_config(args.semantic_config))
+        if args.semantic_evaluator
+        else None
+    )
     raise SystemExit(
         audit_dataset(
             root=args.dataset,
@@ -818,6 +973,8 @@ def main() -> None:
             depth_sample_frames=args.depth_sample_frames,
             duplicate_check=args.duplicate_check,
             video_sample_stride=args.video_sample_stride,
+            semantic_evaluator=semantic_evaluator,
+            semantic_review_threshold=args.semantic_review_threshold,
         )
     )
 

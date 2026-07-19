@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import binascii
+import csv
 import json
 import struct
 import tempfile
@@ -15,10 +16,33 @@ import pyarrow.parquet as pq
 from dataset_clean_build import build_clean_dataset
 from data_quality_audit import audit_dataset
 from dataset_merge import merge_datasets
+from utils.semantic_evaluator import load_evaluator
 
 
 DEPTH_KEY = "observation.images.front_depth"
 RGB_KEY = "observation.images.front"
+
+
+class DeterministicSemanticEvaluator:
+    name = "deterministic_test_evaluator"
+
+    def __init__(self) -> None:
+        self.seen: list[int] = []
+
+    def evaluate(self, episode):
+        self.seen.append(episode.episode_index)
+        if not episode.tasks or not episode.videos:
+            raise AssertionError("semantic evaluator did not receive task and video context")
+        if episode.episode_index == 0:
+            return {
+                "progress_curve": [0.05, 0.18, 0.27],
+                "success_probability": 0.20,
+                "details": {"source": "synthetic"},
+            }
+        return {
+            "progress_curve": [0.10, 0.55, 0.92],
+            "success_probability": 0.88,
+        }
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -212,6 +236,47 @@ def write_rgb_dataset(root: Path, name: str, lengths: list[int], base_value: int
 
 
 class LeRobotPipelineTests(unittest.TestCase):
+    def test_semantic_evaluator_marks_only_low_score_episode_for_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_rgb_dataset(root, "semantic_dataset", [3, 2], 10)
+            report_dir = root / "semantic_quality_report"
+            evaluator = load_evaluator(f"{__name__}:DeterministicSemanticEvaluator")
+
+            exit_code = audit_dataset(
+                root=dataset,
+                out_dir=report_dir,
+                depth_check="header",
+                video_check="metadata",
+                video_content_check="none",
+                sample_frames=0,
+                depth_sample_frames=0,
+                duplicate_check="none",
+                video_sample_stride=30,
+                semantic_evaluator=evaluator,
+                semantic_review_threshold=0.5,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(evaluator.seen, [0, 1])
+            with (report_dir / "quality_report.csv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["status"], "review")
+            self.assertEqual(rows[0]["structural_status"], "keep")
+            self.assertEqual(rows[0]["semantic_status"], "review")
+            self.assertEqual(rows[0]["semantic_evaluator"], evaluator.name)
+            self.assertEqual(float(rows[0]["semantic_progress_final"]), 0.27)
+            self.assertEqual(float(rows[0]["semantic_success_probability"]), 0.20)
+            self.assertEqual(rows[0]["semantic_failure_stage"], "early_progress")
+            self.assertIn("semantic_low_score_review", rows[0]["review_reasons"])
+            self.assertEqual(rows[1]["status"], "keep")
+            self.assertEqual(rows[1]["semantic_status"], "pass")
+            self.assertEqual((report_dir / "review_episodes.txt").read_text(encoding="utf-8").strip(), "0")
+            summary = json.loads((report_dir / "quality_summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["semantic_evaluation"]["enabled"])
+            self.assertEqual(summary["semantic_evaluation"]["pass"], 1)
+            self.assertEqual(summary["semantic_evaluation"]["review"], 1)
+
     def test_merge_audit_and_clean_small_rgbd_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
