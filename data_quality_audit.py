@@ -46,6 +46,7 @@ from utils.semantic_evaluator import (
     load_evaluator_config,
     normalize_result,
 )
+from utils.task_semantic_profile import TaskProfileRegistry, TaskSemanticProfile
 from utils.quality_utils import (
     EpisodeQuality,
     build_episode_columns,
@@ -71,6 +72,7 @@ class AuditConfig:
     video_sample_stride: int
     semantic_evaluator: SemanticEvaluator | None = None
     semantic_review_threshold: float = 0.5
+    task_profiles: TaskProfileRegistry | None = None
 
 
 @dataclass(frozen=True)
@@ -657,9 +659,13 @@ def semantic_videos_for_episode(
     config: AuditConfig,
     metadata: DatasetMetadata,
     record: EpisodeRecord,
+    profile: TaskSemanticProfile | None = None,
 ) -> tuple[VideoSegment, ...]:
     videos: list[VideoSegment] = []
+    preferred_keys = set(profile.preferred_video_keys) if profile is not None else set()
     for video_key in metadata.video_keys:
+        if preferred_keys and video_key not in preferred_keys:
+            continue
         chunk = int(metadata.episode_cols[f"videos/{video_key}/chunk_index"][record.row])
         file_index = int(metadata.episode_cols[f"videos/{video_key}/file_index"][record.row])
         from_timestamp = float(metadata.episode_cols[f"videos/{video_key}/from_timestamp"][record.row])
@@ -699,13 +705,50 @@ def apply_semantic_evaluation(
         audit.semantic_status = "error"
         audit.review("semantic_task_text_missing_review")
         return
+    if len(tasks) > 1:
+        audit.semantic_status = "error"
+        audit.metrics["semantic_episode_tasks"] = list(tasks)
+        audit.review("semantic_multi_task_episode_requires_segmentation_review")
+        return
+
+    profile: TaskSemanticProfile | None = None
+    if config.task_profiles is not None:
+        try:
+            profile = config.task_profiles.match_any(tasks)
+        except Exception as exc:
+            audit.semantic_status = "error"
+            audit.metrics["semantic_profile_error"] = f"{type(exc).__name__}:{str(exc)[:500]}"
+            audit.review("semantic_task_profile_ambiguous_review")
+            return
+        if profile is None:
+            audit.semantic_status = "error"
+            audit.review("semantic_task_profile_missing_review")
+            return
+        audit.semantic_task_profile = profile.task_key
+
+    threshold = (
+        profile.effective_review_threshold(config.semantic_review_threshold)
+        if profile is not None
+        else config.semantic_review_threshold
+    )
+    audit.semantic_review_threshold = threshold
+    videos = semantic_videos_for_episode(config, metadata, record, profile)
+    if profile is not None and profile.preferred_video_keys:
+        available_keys = {video.key for video in videos}
+        missing_keys = sorted(set(profile.preferred_video_keys).difference(available_keys))
+        if missing_keys:
+            audit.semantic_status = "error"
+            audit.metrics["semantic_missing_preferred_video_keys"] = missing_keys
+            audit.review("semantic_preferred_video_missing_review")
+            return
 
     episode = SemanticEpisode(
         dataset_root=config.root,
         episode_index=record.episode_index,
         length=record.length,
         tasks=tasks,
-        videos=semantic_videos_for_episode(config, metadata, record),
+        videos=videos,
+        task_profile=profile.to_dict() if profile is not None else None,
     )
     try:
         result = normalize_result(evaluator.evaluate(episode))
@@ -725,9 +768,15 @@ def apply_semantic_evaluation(
         audit.metrics["semantic_progress_peak"] = max(result.progress_curve)
         audit.metrics["semantic_progress_points"] = len(result.progress_curve)
 
-    if result.score < config.semantic_review_threshold:
+    if result.score < threshold:
         audit.semantic_status = "review"
-        audit.semantic_failure_stage = result.failure_stage or infer_failure_stage(result.progress_curve)
+        audit.semantic_failure_stage = (
+            result.failure_stage
+            or (profile.infer_failure_stage(result.progress_curve) if profile is not None else None)
+            or infer_failure_stage(result.progress_curve)
+        )
+        if result.progress_curve and max(result.progress_curve) - result.progress_curve[-1] >= 0.15:
+            audit.metrics["semantic_failure_type"] = "regressed_after_progress"
         audit.review("semantic_low_score_review")
     else:
         audit.semantic_status = "pass"
@@ -837,6 +886,8 @@ def build_summary(
                 evaluator_name(config.semantic_evaluator) if config.semantic_evaluator is not None else None
             ),
             "review_threshold": config.semantic_review_threshold,
+            "task_profiles_enabled": config.task_profiles is not None,
+            "task_profile_count": len(config.task_profiles.profiles) if config.task_profiles else 0,
             "pass": sum(a.semantic_status == "pass" for a in audits),
             "review": sum(a.semantic_status == "review" for a in audits),
             "errors": sum(a.semantic_status == "error" for a in audits),
@@ -911,6 +962,7 @@ def audit_dataset(
     video_sample_stride: int,
     semantic_evaluator: SemanticEvaluator | None = None,
     semantic_review_threshold: float = 0.5,
+    task_profiles: TaskProfileRegistry | None = None,
 ) -> int:
     """Run the quality audit; kept for compatibility with existing utility scripts."""
     if not 0.0 <= semantic_review_threshold <= 1.0:
@@ -927,6 +979,7 @@ def audit_dataset(
         video_sample_stride=video_sample_stride,
         semantic_evaluator=semantic_evaluator,
         semantic_review_threshold=semantic_review_threshold,
+        task_profiles=task_profiles,
     )
     return run_audit(config)
 
@@ -954,12 +1007,23 @@ def main() -> None:
         help="optional JSON configuration passed to the evaluator plugin",
     )
     parser.add_argument("--semantic-review-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--task-profile-dir",
+        type=Path,
+        default=None,
+        help="optional directory containing validated task semantic profile JSON files",
+    )
     args = parser.parse_args()
 
     out_dir = args.out_dir or default_audit_output_dir(args.dataset)
     semantic_evaluator = (
         load_evaluator(args.semantic_evaluator, load_evaluator_config(args.semantic_config))
         if args.semantic_evaluator
+        else None
+    )
+    task_profiles = (
+        TaskProfileRegistry.from_directory(args.task_profile_dir)
+        if args.task_profile_dir is not None
         else None
     )
     raise SystemExit(
@@ -975,6 +1039,7 @@ def main() -> None:
             video_sample_stride=args.video_sample_stride,
             semantic_evaluator=semantic_evaluator,
             semantic_review_threshold=args.semantic_review_threshold,
+            task_profiles=task_profiles,
         )
     )
 

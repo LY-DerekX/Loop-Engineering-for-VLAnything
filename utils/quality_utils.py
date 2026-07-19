@@ -26,6 +26,8 @@ class EpisodeQuality:
     structural_status: str = "keep"
     semantic_status: str = "not_checked"
     semantic_evaluator: str = ""
+    semantic_task_profile: str = ""
+    semantic_review_threshold: float | None = None
     semantic_progress_curve: list[float] = field(default_factory=list)
     semantic_progress_final: float | None = None
     semantic_success_probability: float | None = None
@@ -162,6 +164,8 @@ def write_quality_outputs(out_dir: Path, audits: list[EpisodeQuality], summary: 
         "structural_status",
         "semantic_status",
         "semantic_evaluator",
+        "semantic_task_profile",
+        "semantic_review_threshold",
         "semantic_progress_curve_json",
         "semantic_progress_final",
         "semantic_success_probability",
@@ -184,6 +188,10 @@ def write_quality_outputs(out_dir: Path, audits: list[EpisodeQuality], summary: 
                     "structural_status": audit.structural_status,
                     "semantic_status": audit.semantic_status,
                     "semantic_evaluator": audit.semantic_evaluator,
+                    "semantic_task_profile": audit.semantic_task_profile,
+                    "semantic_review_threshold": (
+                        "" if audit.semantic_review_threshold is None else audit.semantic_review_threshold
+                    ),
                     "semantic_progress_curve_json": json.dumps(audit.semantic_progress_curve),
                     "semantic_progress_final": (
                         "" if audit.semantic_progress_final is None else audit.semantic_progress_final
