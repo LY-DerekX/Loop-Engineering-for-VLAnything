@@ -36,6 +36,7 @@ class SemanticEpisode:
     length: int
     tasks: tuple[str, ...]
     videos: tuple[VideoSegment, ...]
+    task_profile: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)

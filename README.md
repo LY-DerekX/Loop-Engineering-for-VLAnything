@@ -78,6 +78,8 @@ Main capabilities:
 - rewrite episode indices, frame indices, task indices, metadata, parquet tables, video references, and depth sidecars;
 - audit RGB-only LeRobot datasets and RGB-D datasets with depth sidecars;
 - audit RGB videos, optional depth sidecars, action/state tables, metadata completeness, and deterministic quality failures;
+- parse detailed task descriptions into validated, editable semantic profiles;
+- run the local Task Semantic Studio for profile review and semantic audit setup;
 - separate episodes into `keep`, `review`, and `drop` lists;
 - build a clean train-ready dataset from `drop_episodes.txt`;
 - upload the dataset to Hugging Face with resumable large-folder upload support;
@@ -272,6 +274,47 @@ python .\data_quality_audit.py .\lerobot_derek_depth `
   --depth-sample-frames 8
 ```
 
+## Task Semantic Studio
+
+Use the local task window to turn a detailed natural-language description into
+a validated, editable semantic profile:
+
+~~~powershell
+python ./task_semantic_studio.py
+~~~
+
+Recommended workflow:
+
+1. Enter the exact dataset task text in Dataset task text / name.
+2. Write a detailed task description, including the ordered actions and final
+   observable success state.
+3. Select Parse description. The dependency-free local parser creates a draft
+   containing objects, stages, observable conditions, and success/failure
+   criteria.
+4. Review the generated JSON. Add aliases when the dataset may use another
+   exact task string, and set a calibrated review_threshold only when known.
+5. Validate and save the profile into task_profiles/.
+6. Select the dataset and evaluator plugin, then run the audit from the same
+   window.
+
+The local parser is deliberately conservative and its output is a draft. It
+does not invent a confidence threshold. A stronger parser can be installed as
+a module:attribute plugin and selected in the window without changing the
+audit code.
+
+Each saved profile contains:
+
+- task_key, task_name, instruction, and aliases used for exact task matching;
+- objects and attributes;
+- ordered stages with observable video conditions and optional weights;
+- final success and failure criteria;
+- optional preferred_video_keys and a task-specific review_threshold.
+
+The task name or one alias must match the task text referenced by the
+episode's task_index. An episode containing multiple distinct task texts is
+sent to review until it is segmented, rather than receiving one ambiguous
+semantic score.
+
 ## Optional Semantic Quality Evaluation
 
 The deterministic audit can optionally call a project-defined semantic
@@ -300,7 +343,7 @@ Expose either an evaluator instance, an evaluator class, or a factory from a
 Python module, then enable it with module:attribute syntax:
 
 ~~~powershell
-python ./data_quality_audit.py ./lerobot_derek_depth --semantic-evaluator my_quality_backend:create_evaluator --semantic-config ./semantic_evaluator.json --semantic-review-threshold 0.5
+python ./data_quality_audit.py ./lerobot_derek_depth --task-profile-dir ./task_profiles --semantic-evaluator my_quality_backend:create_evaluator --semantic-config ./semantic_evaluator.json --semantic-review-threshold 0.5
 ~~~
 
 The evaluator configuration file is optional and must contain one JSON object.
@@ -315,6 +358,7 @@ Semantic output is added directly to quality_report.csv:
 - semantic_score
 - semantic_failure_stage
 - semantic_status and semantic_evaluator
+- semantic_task_profile and semantic_review_threshold
 
 Success probability is used as the review score when provided; otherwise the
 last progress value is used. A score below the configured threshold adds

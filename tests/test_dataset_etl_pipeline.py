@@ -17,6 +17,7 @@ from dataset_clean_build import build_clean_dataset
 from data_quality_audit import audit_dataset
 from dataset_merge import merge_datasets
 from utils.semantic_evaluator import load_evaluator
+from utils.task_semantic_profile import TaskProfileRegistry, TaskSemanticProfile
 
 
 DEPTH_KEY = "observation.images.front_depth"
@@ -42,6 +43,18 @@ class DeterministicSemanticEvaluator:
         return {
             "progress_curve": [0.10, 0.55, 0.92],
             "success_probability": 0.88,
+        }
+
+
+class ProfileAwareSemanticEvaluator:
+    name = "profile_aware_test_evaluator"
+
+    def evaluate(self, episode):
+        if episode.task_profile is None:
+            raise AssertionError("semantic evaluator did not receive the task profile")
+        return {
+            "progress_curve": [0.10, 0.45],
+            "success_probability": 0.40,
         }
 
 
@@ -236,6 +249,64 @@ def write_rgb_dataset(root: Path, name: str, lengths: list[int], base_value: int
 
 
 class LeRobotPipelineTests(unittest.TestCase):
+    def test_task_profile_controls_threshold_and_failure_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_rgb_dataset(root, "profile_dataset", [3], 10)
+            report_dir = root / "profile_quality_report"
+            profile = TaskSemanticProfile.from_dict(
+                {
+                    "task_key": "pick_up_cups",
+                    "task_name": "pick up cups",
+                    "instruction": "Pick up the cups",
+                    "aliases": ["pick up cups"],
+                    "stages": [
+                        {
+                            "name": "approach",
+                            "description": "Approach the cups",
+                            "observable_condition": "The gripper moves near the cups",
+                        },
+                        {
+                            "name": "grasp",
+                            "description": "Grasp a cup",
+                            "observable_condition": "A cup is held by the gripper",
+                        },
+                        {
+                            "name": "lift",
+                            "description": "Lift the cup",
+                            "observable_condition": "The cup leaves the table",
+                        },
+                    ],
+                    "success_criteria": ["The cup is lifted"],
+                    "failure_criteria": ["The cup remains on the table"],
+                    "review_threshold": 0.60,
+                }
+            )
+            registry = TaskProfileRegistry((profile,))
+
+            exit_code = audit_dataset(
+                root=dataset,
+                out_dir=report_dir,
+                depth_check="header",
+                video_check="metadata",
+                video_content_check="none",
+                sample_frames=0,
+                depth_sample_frames=0,
+                duplicate_check="none",
+                video_sample_stride=30,
+                semantic_evaluator=ProfileAwareSemanticEvaluator(),
+                semantic_review_threshold=0.5,
+                task_profiles=registry,
+            )
+
+            self.assertEqual(exit_code, 0)
+            with (report_dir / "quality_report.csv").open(newline="", encoding="utf-8") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["semantic_task_profile"], "pick_up_cups")
+            self.assertEqual(float(row["semantic_review_threshold"]), 0.60)
+            self.assertEqual(row["semantic_status"], "review")
+            self.assertEqual(row["semantic_failure_stage"], "grasp")
+
     def test_semantic_evaluator_marks_only_low_score_episode_for_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
