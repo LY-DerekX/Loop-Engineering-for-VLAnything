@@ -27,12 +27,14 @@ $LEROBOT_ROOT="<path-to-lerobot>"
 Copy-Item -Recurse -Force .\rgbd_record\examples $LEROBOT_ROOT\
 Copy-Item -Recurse -Force .\rgbd_record\src $LEROBOT_ROOT\
 Copy-Item -Force .\rgbd_record\pyproject.toml $LEROBOT_ROOT\
+Copy-Item -Recurse -Force .\policy_improvement $LEROBOT_ROOT\
 ```
 
 After copying, the expected layout is:
 
 ```text
 <lerobot_root>/examples/rgbd_vla_depth/
+<lerobot_root>/policy_improvement/
 <lerobot_root>/src/lerobot/cameras/orbbec/
 <lerobot_root>/src/lerobot/scripts/
 <lerobot_root>/src/lerobot/robots/so_follower/
@@ -52,7 +54,9 @@ python -m pip install -e ".[feetech,orbbec,rgbd_vla]" -e .\examples\rgbd_vla_dep
 - `src/lerobot/scripts/`: patched LeRobot commands for finding cameras, recording, calibration, and teleoperation.
 - `src/lerobot/robots/so_follower/`: SO follower support for RGB-D observations.
 - `examples/rgbd_vla_depth/record.py`: RGB-D recording entrypoint.
+- `examples/rgbd_vla_depth/feedback_record.py`: human-guided policy feedback entrypoint.
 - `examples/rgbd_vla_depth/configs/record_rgbd.yaml`: example Orbbec + wrist camera recording config.
+- `examples/rgbd_vla_depth/configs/record_rgbd_feedback.yaml`: recovery/correction, event-buffer, and continuous capture config.
 - `examples/rgbd_vla_depth/src/lerobot_policy_rgbd_vla_depth/data/`: helpers for depth feature naming and uint16 PNG sidecar storage.
 
 ## Dataset Output
@@ -79,6 +83,19 @@ Record RGB-D data:
 ```powershell
 python .\examples\rgbd_vla_depth\record.py --config_path=.\examples\rgbd_vla_depth\configs\record_rgbd.yaml
 ```
+
+Collect policy feedback with explicit Recovery/Correction labels:
+
+```powershell
+python .\examples\rgbd_vla_depth\feedback_record.py `
+  --config_path=.\examples\rgbd_vla_depth\configs\record_rgbd_feedback.yaml `
+  --policy.path=.\outputs\train\run\checkpoints\last\pretrained_model
+```
+
+The safe default is `feedback.mode: corrections_only`. Press `i` to align the
+actuated teleoperator and begin Recovery, `c` to mark Correction, and `i` again
+to save the intervention and hand control back to the policy. The associated
+feedback sidecar stays outside the recorded dataset.
 
 Visualize recorded depth after collection from this repository root:
 

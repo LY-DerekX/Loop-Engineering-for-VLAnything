@@ -357,7 +357,6 @@ def validate_full_dataset(path: Path) -> None:
         path / "meta" / "episodes" / "chunk-000" / "file-000.parquet",
         path / "data",
         path / "videos",
-        path / "depth_sidecar",
     ]
     missing = [str(item) for item in required if not item.exists()]
     if missing:

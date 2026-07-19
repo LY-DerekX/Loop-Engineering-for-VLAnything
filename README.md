@@ -80,6 +80,10 @@ Main capabilities:
 - audit RGB videos, optional depth sidecars, action/state tables, metadata completeness, and deterministic quality failures;
 - parse detailed task descriptions into validated, editable semantic profiles;
 - run the local Task Semantic Studio for profile review and semantic audit setup;
+- generate validated subtask, event, state, and summary language sidecars for approved trajectories;
+- collect human recovery/correction feedback with explicit action provenance;
+- build weighted feedback datasets without treating autonomous failures as expert actions;
+- run plugin-based train, evaluate, promote, and deploy policy iterations;
 - separate episodes into `keep`, `review`, and `drop` lists;
 - build a clean train-ready dataset from `drop_episodes.txt`;
 - upload the dataset to Hugging Face with resumable large-folder upload support;
@@ -185,6 +189,7 @@ $LEROBOT_ROOT="E:\path\to\lerobot"
 Copy-Item -Recurse -Force .\rgbd_record\examples $LEROBOT_ROOT\
 Copy-Item -Recurse -Force .\rgbd_record\src $LEROBOT_ROOT\
 Copy-Item -Force .\rgbd_record\pyproject.toml $LEROBOT_ROOT\
+Copy-Item -Recurse -Force .\policy_improvement $LEROBOT_ROOT\
 ```
 
 After copying, the required files should appear directly under the LeRobot checkout:
@@ -283,7 +288,13 @@ a validated, editable semantic profile:
 python ./task_semantic_studio.py
 ~~~
 
-Recommended workflow:
+The Profile directory is optional when running an audit. Leave it blank to
+send the dataset task text and all available episode videos directly to the
+evaluator with the global failure and pass thresholds. Select a Profile
+directory to add task-specific stages, success criteria, preferred video keys,
+and threshold overrides.
+
+Recommended profile-enhanced workflow:
 
 1. Enter the exact dataset task text in Dataset task text / name.
 2. Write a detailed task description, including the ordered actions and final
@@ -292,10 +303,12 @@ Recommended workflow:
    containing objects, stages, observable conditions, and success/failure
    criteria.
 4. Review the generated JSON. Add aliases when the dataset may use another
-   exact task string, and set a calibrated review_threshold only when known.
+   exact task string. Set calibrated review_threshold and pass_threshold
+   overrides only when labeled validation data is available.
 5. Validate and save the profile into task_profiles/.
-6. Select the dataset and evaluator plugin, then run the audit from the same
-   window.
+6. Select the dataset and evaluator plugin, keep the Profile directory selected,
+   then run the audit from the same window. Clear the Profile directory to run
+   without Profile matching.
 
 The local parser is deliberately conservative and its output is a draft. It
 does not invent a confidence threshold. A stronger parser can be installed as
@@ -308,12 +321,15 @@ Each saved profile contains:
 - objects and attributes;
 - ordered stages with observable video conditions and optional weights;
 - final success and failure criteria;
-- optional preferred_video_keys and a task-specific review_threshold.
+- optional preferred_video_keys and task-specific review_threshold and
+  pass_threshold values.
 
-The task name or one alias must match the task text referenced by the
-episode's task_index. An episode containing multiple distinct task texts is
-sent to review until it is segmented, rather than receiving one ambiguous
-semantic score.
+When a Profile directory is configured, the task name or one alias must match
+the task text referenced by the episode's task_index; an unmatched task is sent
+to review. Without a Profile directory, matching is skipped and the evaluator
+receives task_profile=None. In both modes, an episode containing multiple
+distinct task texts is sent to review until it is segmented, rather than
+receiving one ambiguous semantic score.
 
 ## Optional Semantic Quality Evaluation
 
@@ -343,7 +359,30 @@ Expose either an evaluator instance, an evaluator class, or a factory from a
 Python module, then enable it with module:attribute syntax:
 
 ~~~powershell
-python ./data_quality_audit.py ./lerobot_derek_depth --task-profile-dir ./task_profiles --semantic-evaluator my_quality_backend:create_evaluator --semantic-config ./semantic_evaluator.json --semantic-review-threshold 0.5
+python ./data_quality_audit.py ./lerobot_derek_depth --semantic-evaluator my_quality_backend:create_evaluator --semantic-config ./semantic_evaluator.json --semantic-failure-threshold 0.5 --semantic-pass-threshold 0.9
+~~~
+
+`--semantic-review-threshold` remains accepted as a compatibility alias for
+`--semantic-failure-threshold`.
+
+Add `--task-profile-dir ./task_profiles` when task-specific matching and
+protections are required.
+
+~~~mermaid
+flowchart TD
+    A[Task text and episode videos] --> B{Profile directory configured?}
+    B -- No --> C[Use all available videos and global thresholds]
+    B -- Yes --> D{Task Profile matched?}
+    D -- No --> E[Send episode to review]
+    D -- Yes --> F[Use Profile stages, preferred views, and threshold overrides]
+    C --> G[Semantic evaluator]
+    F --> G
+    G --> H[Progress, success probability, and failure stage]
+    H --> I{Score below failure threshold?}
+    I -- Yes --> J[Likely failure review]
+    I -- No --> K{Score below pass threshold?}
+    K -- Yes --> L[Uncertain score review]
+    K -- No --> M[Semantic pass]
 ~~~
 
 The evaluator configuration file is optional and must contain one JSON object.
@@ -358,14 +397,306 @@ Semantic output is added directly to quality_report.csv:
 - semantic_score
 - semantic_failure_stage
 - semantic_status and semantic_evaluator
-- semantic_task_profile and semantic_review_threshold
+- semantic_task_profile, semantic_review_threshold, and semantic_pass_threshold
 
 Success probability is used as the review score when provided; otherwise the
-last progress value is used. A score below the configured threshold adds
-semantic_low_score_review and never turns a trajectory into a hard drop.
-Evaluator errors also go to review so model failures cannot silently approve
-data. Episodes already marked drop by deterministic checks skip semantic
-inference.
+last progress value is used. The default decision bands are:
+
+- score below 0.5: semantic_low_score_review;
+- score from 0.5 up to, but not including, 0.9:
+  semantic_uncertain_score_review;
+- score at or above 0.9: semantic pass.
+
+Both lower bands go to review and never turn a trajectory into a hard drop.
+Only the upper band can enter keep when no other issue exists. These defaults
+are conservative gates, not proof that the score is calibrated: before relying
+on automatic pass, measure false-positive rates on human-labeled episodes and
+continue sampling high-scoring episodes for manual review. Evaluator errors
+also go to review so model failures cannot silently approve data. Episodes
+already marked drop by deterministic checks skip semantic inference.
+
+## Trajectory Language Enrichment
+
+The third layer describes what happens inside an approved trajectory; it does
+not decide whether the trajectory is good or bad. Run it after deterministic
+and semantic quality review so annotation compute is spent only on usable data:
+
+~~~mermaid
+flowchart TD
+    A[Quality report] --> B{Episode selection}
+    B -- Default --> C[keep episodes]
+    B -- Human-approved list --> D[keep and approved review episodes]
+    B -- drop episode --> E[Reject]
+    C --> F[Optional Task Profile plus annotator plugin]
+    D --> F
+    F --> G[Validate frame ranges, ordering, and language fields]
+    G --> H[Write external language sidecars]
+~~~
+
+Launch the local setup window:
+
+~~~powershell
+python ./trajectory_language_studio.py
+~~~
+
+Or call the processor directly. The quality report defaults to
+`quality_audit_reports/<dataset_name>/quality_report.csv` when omitted:
+
+~~~powershell
+python ./trajectory_language_enrichment.py ./robot_dataset `
+  --quality-report ./quality_audit_reports/robot_dataset/quality_report.csv `
+  --task-profile-dir ./task_profiles `
+  --annotator my_language_backend:create_annotator `
+  --annotator-config ./language_annotator.json
+~~~
+
+An annotator plugin receives exactly one task, episode-local frame count,
+episode-scoped video segments, an optional Task Profile, and the corresponding
+semantic quality context. It returns time-aligned language fields:
+
+~~~python
+class MyLanguageAnnotator:
+    name = "my_language_annotator"
+
+    def annotate(self, episode):
+        return {
+            "subtasks": [
+                {
+                    "start_frame": 0,
+                    "end_frame": 45,
+                    "stage": "approach",
+                    "text": "approach the red cup",
+                }
+            ],
+            "events": [
+                {
+                    "frame_index": 46,
+                    "event": "gripper_closing",
+                    "description": "The gripper starts closing around the cup.",
+                }
+            ],
+            "state_descriptions": [
+                {
+                    "start_frame": 0,
+                    "end_frame": 46,
+                    "level": "state",
+                    "text": "The gripper moves from free space toward the cup.",
+                }
+            ],
+            "summary": "The robot approaches the cup and begins the grasp.",
+        }
+~~~
+
+By default only rows whose final quality status is `keep` are processed. Use
+`--approved-episodes approved_episodes.txt` after human review to explicitly
+include selected `review` episodes. An episode whose quality status is `drop`
+is rejected even if it appears in that file. When `quality_summary.json` is
+available beside the CSV, its dataset path must match the selected dataset;
+episode lengths are also cross-checked when present in the report.
+
+Outputs are external sidecars; the source dataset is never modified:
+
+~~~text
+language_enrichment_outputs/<dataset_name>/
+  enrichment_manifest.json
+  language_annotations.jsonl
+  subtasks.jsonl
+  events.jsonl
+  state_descriptions.jsonl
+  annotations/
+    episode-000000.json
+~~~
+
+All generated annotations are validated for local frame bounds, chronological
+ordering, non-overlapping subtasks, required text, confidence ranges, and JSON
+serializability. Each annotation also records its second-layer quality context;
+when a Task Profile is configured, named subtask stages must belong to that
+Profile. The framework deliberately does not fabricate annotations without an
+annotator plugin. Automatically generated language remains model output and
+should be sampled for human verification before training.
+
+## Closed-Loop Policy Improvement
+
+The fourth layer collects targeted human feedback from states visited by a
+deployed policy. It uses project-owned names and contracts rather than exposing
+an upstream deployment command. The default path records only human recovery
+and correction frames, so autonomous failure actions cannot silently become
+expert targets.
+
+### Collect human-guided RGB-D feedback
+
+Use the dedicated feedback entrypoint after copying `policy_improvement/` and
+the RGB-D overlay into the robot runtime checkout:
+
+~~~powershell
+python ./examples/rgbd_vla_depth/feedback_record.py `
+  --config_path=./examples/rgbd_vla_depth/configs/record_rgbd_feedback.yaml `
+  --policy.path=./outputs/train/run/checkpoints/last/pretrained_model
+~~~
+
+The default keyboard workflow is:
+
+1. `i`: pause autonomous control, align the actuated teleoperator, and begin
+   Recovery.
+2. `c`: mark the first Correction frame after at least one Recovery frame.
+3. `i`: complete the correction, save the feedback episode, reset policy state,
+   and return control to the policy.
+4. `esc`: request a clean session stop. A stop request never cuts an active
+   intervention in half.
+
+Automatic alignment is required by default. A passive or unsupported
+teleoperator is rejected instead of moving the follower to an unverified pose.
+Hardware-specific systems can provide another handover adapter, but must verify
+leader/follower synchronization and emergency-stop behavior on the real robot.
+
+Three capture modes are available in
+`examples/rgbd_vla_depth/configs/record_rgbd_feedback.yaml`:
+
+- `corrections_only`: records Recovery and Correction frames only. These frames
+  are marked training-eligible and this is the recommended first deployment.
+- `event_buffer`: retains a bounded pre-event window. Press `h` to start/stop a
+  manual event capture; a takeover also flushes the pre-event window. Autonomous
+  frames are retained for analysis but remain ineligible as expert targets.
+- `continuous`: records autonomous and human-controlled frames and rotates
+  episodes by time without resetting policy state at rotation boundaries.
+  Autonomous frames remain ineligible by default.
+
+Each capture session writes an external sidecar:
+
+~~~text
+feedback_outputs/<dataset>/<session>/
+  session_manifest.json
+  frame_feedback.parquet
+  episode_feedback.jsonl
+  intervention_segments.jsonl
+~~~
+
+The frame sidecar records `phase`, `intervention_id`, trigger source, the
+policy-proposed action, the action actually executed, and whether the frame may
+be used as an expert target. The dataset's normal `action` remains the action
+actually sent to the robot.
+
+### Audit feedback alignment
+
+Pass the feedback sidecar into the existing deterministic and semantic audit:
+
+~~~powershell
+python ./data_quality_audit.py ./data/so100_rgbd_feedback `
+  --feedback-sidecar ./feedback_outputs/so100_rgbd_feedback/session-001 `
+  --semantic-evaluator my_quality_backend:create_evaluator `
+  --semantic-failure-threshold 0.5 `
+  --semantic-pass-threshold 0.9
+~~~
+
+In addition to the normal RGB, depth, action, state, timestamp, and semantic
+checks, the audit validates sidecar/dataset episode lengths, contiguous frame
+indices, intervention ranges, phase labels, and training eligibility. Feedback
+outcomes such as `aborted`, `failure`, or `pending_review` enter review.
+
+The resulting `quality_report.csv` exposes feedback counts in `metrics_json`.
+The language enrichment layer already forwards this metrics object to its
+annotator, allowing Recovery/Correction events to receive task-stage language
+without changing the source dataset.
+
+Newly recorded feedback has `review_status=pending`, so the audit sends it to
+review even when structural checks pass. After inspection, write the accepted
+episode indices into a separate approval list; that list is the human approval
+record and does not mutate the capture sidecar.
+
+### Build the feedback training dataset
+
+After review and optional language enrichment, build a new physical training
+dataset:
+
+~~~powershell
+python ./feedback_dataset_build.py `
+  --base-dataset ./data/original_clean_dataset `
+  --feedback-dataset ./data/so100_rgbd_feedback `
+  --feedback-sidecar ./feedback_outputs/so100_rgbd_feedback/session-001 `
+  --quality-report ./quality_audit_reports/so100_rgbd_feedback/quality_report.csv `
+  --approved-episodes ./approved_feedback_episodes.txt `
+  --language-enrichment ./language_enrichment_outputs/so100_rgbd_feedback `
+  --out-dir ./iteration_datasets/iteration-001
+~~~
+
+Default selection includes only `keep` feedback episodes whose sidecar review
+status is already approved. Pass `--approved-episodes` to record explicit human
+approval for pending/review episodes; a `drop` or human-rejected episode is
+always rejected. The standard builder accepts corrections-only
+episodes and refuses event/continuous episodes containing autonomous frames
+until they are segmented, preventing label contamination.
+
+The output contains:
+
+~~~text
+iteration_datasets/iteration-001/
+  data/
+  meta/
+  videos/
+  depth_sidecar/
+  feedback_build_manifest.json
+  training_sidecars/
+    training_weights.parquet
+    language_annotations.jsonl   # when supplied
+~~~
+
+Base demonstrations receive weight `1.0`, Recovery defaults to `1.0`, and
+Correction defaults to `2.0`. These are external sampling hints; a trainer must
+explicitly opt into the weights. The manifest records source datasets, episode
+mapping, quality selection, language provenance, and confirms that autonomous
+failure actions were not used as expert targets.
+
+### Optional asynchronous event triggers
+
+`event_buffer` can load a calibrated window evaluator through
+`module:attribute` configuration. The evaluator receives a snapshot of recent
+packets and returns a trigger signal:
+
+~~~python
+class MyWindowEvaluator:
+    name = "my_window_evaluator"
+
+    def evaluate_window(self, packets):
+        return {
+            "triggered": False,
+            "source": "semantic",
+            "score": 0.8,
+            "reason": "",
+        }
+~~~
+
+Inference runs in a single background worker and never blocks the control loop.
+It is disabled in the example configuration. Enable it only after measuring
+false positives and false negatives on human-labelled windows. Automatic
+triggers save data; they do not automatically transfer robot control.
+
+### Train, evaluate, promote, and deploy
+
+`policy_iteration.py` keeps model-specific commands behind three plugins:
+
+~~~python
+class MyTrainer:
+    def train(self, request): ...
+
+class MyEvaluator:
+    def evaluate(self, request): ...
+
+class MyDeployer:
+    def deploy(self, request): ...
+~~~
+
+Run one iteration from a JSON configuration:
+
+~~~powershell
+python ./policy_iteration.py ./configs/policy_iteration.example.json
+~~~
+
+Promotion requires the configured success rate, intervention rate, critical
+failure limits, and a separate human approval file. Deployment is not called
+when any gate fails. Every stage updates `iteration_manifest.json`, making the
+checkpoint, metrics, promotion decision, deployment target, and failure state
+auditable. Plugin configuration is not copied into the manifest, avoiding
+accidental persistence of credentials.
 
 ## Check Completeness
 

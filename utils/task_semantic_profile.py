@@ -82,6 +82,7 @@ class TaskSemanticProfile:
     review_threshold: float | None = None
     notes: str = ""
     schema_version: int = PROFILE_SCHEMA_VERSION
+    pass_threshold: float | None = None
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TaskSemanticProfile":
@@ -92,6 +93,7 @@ class TaskSemanticProfile:
         if isinstance(raw_objects, (str, bytes)) or not isinstance(raw_objects, Sequence):
             raise TypeError("objects must be a sequence")
         threshold_value = value.get("review_threshold")
+        pass_threshold_value = value.get("pass_threshold")
         profile = cls(
             task_key=str(value.get("task_key", "")).strip(),
             task_name=str(value.get("task_name", "")).strip(),
@@ -105,6 +107,9 @@ class TaskSemanticProfile:
                 value.get("preferred_video_keys", ()), "preferred_video_keys"
             ),
             review_threshold=None if threshold_value is None else float(threshold_value),
+            pass_threshold=(
+                None if pass_threshold_value is None else float(pass_threshold_value)
+            ),
             notes=str(value.get("notes", "")).strip(),
             schema_version=int(value.get("schema_version", PROFILE_SCHEMA_VERSION)),
         )
@@ -150,6 +155,14 @@ class TaskSemanticProfile:
                 errors.append(f"object[{index}].name is required")
         if self.review_threshold is not None and not 0.0 <= self.review_threshold <= 1.0:
             errors.append("review_threshold must be within [0, 1]")
+        if self.pass_threshold is not None and not 0.0 <= self.pass_threshold <= 1.0:
+            errors.append("pass_threshold must be within [0, 1]")
+        if (
+            self.review_threshold is not None
+            and self.pass_threshold is not None
+            and self.review_threshold > self.pass_threshold
+        ):
+            errors.append("review_threshold must not exceed pass_threshold")
         if errors:
             raise ValueError("invalid task semantic profile: " + "; ".join(errors))
 
@@ -159,6 +172,9 @@ class TaskSemanticProfile:
 
     def effective_review_threshold(self, default: float) -> float:
         return self.review_threshold if self.review_threshold is not None else default
+
+    def effective_pass_threshold(self, default: float) -> float:
+        return self.pass_threshold if self.pass_threshold is not None else default
 
     def infer_failure_stage(self, progress_curve: Sequence[float]) -> str:
         if not self.stages:
@@ -188,6 +204,7 @@ class TaskSemanticProfile:
             "failure_criteria": list(self.failure_criteria),
             "preferred_video_keys": list(self.preferred_video_keys),
             "review_threshold": self.review_threshold,
+            "pass_threshold": self.pass_threshold,
             "notes": self.notes,
         }
 

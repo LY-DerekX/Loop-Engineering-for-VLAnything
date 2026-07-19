@@ -386,9 +386,28 @@ def write_merged_metadata(config: MergeConfig, first_info: dict[str, Any], src_p
         copy_file(recording, meta_dir / "rgbd_vla_depth_recording.json", "copy")
 
 
-def run_merge(config: MergeConfig) -> None:
+def run_merge_paths(src_paths: list[Path], out_dir: Path, overwrite: bool, copy_mode: str) -> None:
+    """Merge explicitly addressed datasets without staging them under one parent."""
+    if not src_paths:
+        raise ValueError("at least one source dataset is required")
+    resolved_sources = [path.resolve() for path in src_paths]
+    if len(set(resolved_sources)) != len(resolved_sources):
+        raise ValueError("source dataset paths must be unique")
+    out_resolved = out_dir.resolve() if out_dir.exists() else out_dir.absolute()
+    if out_resolved in resolved_sources:
+        raise ValueError("merge output must not overwrite a source dataset")
+    for path in resolved_sources:
+        validate_merge_source_dataset(path)
+
+    config = MergeConfig(
+        src_root=Path("."),
+        out_dir=out_dir,
+        overwrite=overwrite,
+        dataset_names=[],
+        copy_mode=copy_mode,
+    )
     prepare_merge_output(config)
-    src_paths = source_dataset_paths(config)
+    src_paths = resolved_sources
     first_info = read_json(src_paths[0] / "meta" / "info.json")
     video_keys = video_keys_from_info(first_info)
     image_keys = image_keys_from_info(first_info)
@@ -410,6 +429,15 @@ def run_merge(config: MergeConfig) -> None:
     print(f"Total frames: {state.total_frames}")
     print(f"Total tasks: {state.task_offset}")
     print(f"Depth files materialized from parquet bytes: {state.missing_depth_written_total}")
+
+
+def run_merge(config: MergeConfig) -> None:
+    run_merge_paths(
+        source_dataset_paths(config),
+        out_dir=config.out_dir,
+        overwrite=config.overwrite,
+        copy_mode=config.copy_mode,
+    )
 
 
 def merge_datasets(

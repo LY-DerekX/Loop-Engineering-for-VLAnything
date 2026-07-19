@@ -1,0 +1,66 @@
+robot:
+  type: so100_follower
+  id: so100_rgbd_follower
+  port: /dev/ttyACM0
+  use_degrees: true
+  cameras:
+    front:
+      type: orbbec
+      serial_number_or_name: "REPLACE_WITH_FEMTO_BOLT_SERIAL"
+      fps: 30
+      width: 1280
+      height: 720
+      use_depth: true
+      depth_fps: 30
+      depth_width: 640
+      depth_height: 576
+      align_depth_to_color: true
+    wrist:
+      type: opencv
+      index_or_path: /dev/video0
+      fps: 30
+      width: 640
+      height: 480
+teleop:
+  type: so100_leader
+  id: so100_leader
+  port: /dev/ttyACM1
+policy:
+  path: REPLACE_WITH_PRETRAINED_POLICY
+dataset:
+  repo_id: YOUR_HF_USERNAME/so100_rgbd_feedback
+  root: ./data/so100_rgbd_feedback
+  fps: 30
+  single_task: Place the object precisely using the front depth camera.
+  num_episodes: 20
+  episode_time_s: 300
+  reset_time_s: 0
+  video: true
+  push_to_hub: false
+  streaming_encoding: false
+feedback:
+  # corrections_only is the safe default for feedback training.
+  # event_buffer and continuous retain autonomous frames as analysis-only data.
+  mode: corrections_only
+  sidecar_dir: ./feedback_outputs/so100_rgbd_feedback/session-001
+  session_id: session-001
+  source_policy: policy-v001
+  overwrite_sidecar: false
+  keyboard_enabled: true
+  toggle_control_key: i
+  begin_correction_key: c
+  cancel_key: x
+  save_event_key: h
+  stop_key: esc
+  buffer_seconds: 15
+  buffer_memory_mb: 2048
+  require_feedback_alignment: true
+  synchronization_seconds: 0.5
+  automatic_trigger:
+    # Keep disabled until the window evaluator is calibrated on human labels.
+    plugin: null
+    config_path: null
+    interval_frames: 30
+    post_trigger_seconds: 5
+display_data: true
+display_port: 9876
