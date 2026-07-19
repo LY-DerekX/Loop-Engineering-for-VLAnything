@@ -40,9 +40,14 @@ class DeterministicSemanticEvaluator:
                 "success_probability": 0.20,
                 "details": {"source": "synthetic"},
             }
+        if episode.episode_index == 1:
+            return {
+                "progress_curve": [0.10, 0.55, 0.92],
+                "success_probability": 0.88,
+            }
         return {
-            "progress_curve": [0.10, 0.55, 0.92],
-            "success_probability": 0.88,
+            "progress_curve": [0.15, 0.70, 0.97],
+            "success_probability": 0.96,
         }
 
 
@@ -280,6 +285,7 @@ class LeRobotPipelineTests(unittest.TestCase):
                     "success_criteria": ["The cup is lifted"],
                     "failure_criteria": ["The cup remains on the table"],
                     "review_threshold": 0.60,
+                    "pass_threshold": 0.95,
                 }
             )
             registry = TaskProfileRegistry((profile,))
@@ -296,6 +302,7 @@ class LeRobotPipelineTests(unittest.TestCase):
                 video_sample_stride=30,
                 semantic_evaluator=ProfileAwareSemanticEvaluator(),
                 semantic_review_threshold=0.5,
+                semantic_pass_threshold=0.9,
                 task_profiles=registry,
             )
 
@@ -304,13 +311,14 @@ class LeRobotPipelineTests(unittest.TestCase):
                 row = next(csv.DictReader(handle))
             self.assertEqual(row["semantic_task_profile"], "pick_up_cups")
             self.assertEqual(float(row["semantic_review_threshold"]), 0.60)
+            self.assertEqual(float(row["semantic_pass_threshold"]), 0.95)
             self.assertEqual(row["semantic_status"], "review")
             self.assertEqual(row["semantic_failure_stage"], "grasp")
 
-    def test_semantic_evaluator_marks_only_low_score_episode_for_review(self) -> None:
+    def test_semantic_evaluator_uses_failure_uncertainty_and_pass_bands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            dataset = write_rgb_dataset(root, "semantic_dataset", [3, 2], 10)
+            dataset = write_rgb_dataset(root, "semantic_dataset", [3, 2, 2], 10)
             report_dir = root / "semantic_quality_report"
             evaluator = load_evaluator(f"{__name__}:DeterministicSemanticEvaluator")
 
@@ -326,10 +334,11 @@ class LeRobotPipelineTests(unittest.TestCase):
                 video_sample_stride=30,
                 semantic_evaluator=evaluator,
                 semantic_review_threshold=0.5,
+                semantic_pass_threshold=0.9,
             )
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual(evaluator.seen, [0, 1])
+            self.assertEqual(evaluator.seen, [0, 1, 2])
             with (report_dir / "quality_report.csv").open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["status"], "review")
@@ -338,15 +347,25 @@ class LeRobotPipelineTests(unittest.TestCase):
             self.assertEqual(rows[0]["semantic_evaluator"], evaluator.name)
             self.assertEqual(float(rows[0]["semantic_progress_final"]), 0.27)
             self.assertEqual(float(rows[0]["semantic_success_probability"]), 0.20)
+            self.assertEqual(float(rows[0]["semantic_review_threshold"]), 0.5)
+            self.assertEqual(float(rows[0]["semantic_pass_threshold"]), 0.9)
             self.assertEqual(rows[0]["semantic_failure_stage"], "early_progress")
             self.assertIn("semantic_low_score_review", rows[0]["review_reasons"])
-            self.assertEqual(rows[1]["status"], "keep")
-            self.assertEqual(rows[1]["semantic_status"], "pass")
-            self.assertEqual((report_dir / "review_episodes.txt").read_text(encoding="utf-8").strip(), "0")
+            self.assertEqual(rows[1]["status"], "review")
+            self.assertEqual(rows[1]["semantic_status"], "review")
+            self.assertIn("semantic_uncertain_score_review", rows[1]["review_reasons"])
+            self.assertEqual(rows[2]["status"], "keep")
+            self.assertEqual(rows[2]["semantic_status"], "pass")
+            self.assertEqual(
+                (report_dir / "review_episodes.txt").read_text(encoding="utf-8").splitlines(),
+                ["0", "1"],
+            )
             summary = json.loads((report_dir / "quality_summary.json").read_text(encoding="utf-8"))
             self.assertTrue(summary["semantic_evaluation"]["enabled"])
             self.assertEqual(summary["semantic_evaluation"]["pass"], 1)
-            self.assertEqual(summary["semantic_evaluation"]["review"], 1)
+            self.assertEqual(summary["semantic_evaluation"]["review"], 2)
+            self.assertEqual(summary["semantic_evaluation"]["low_score_review"], 1)
+            self.assertEqual(summary["semantic_evaluation"]["uncertain_score_review"], 1)
 
     def test_merge_audit_and_clean_small_rgbd_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

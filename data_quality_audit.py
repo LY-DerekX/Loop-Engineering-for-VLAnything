@@ -47,6 +47,7 @@ from utils.semantic_evaluator import (
     normalize_result,
 )
 from utils.task_semantic_profile import TaskProfileRegistry, TaskSemanticProfile
+from policy_improvement.contracts import ControlPhase, FeedbackSidecar
 from utils.quality_utils import (
     EpisodeQuality,
     build_episode_columns,
@@ -73,6 +74,16 @@ class AuditConfig:
     semantic_evaluator: SemanticEvaluator | None = None
     semantic_review_threshold: float = 0.5
     task_profiles: TaskProfileRegistry | None = None
+    semantic_pass_threshold: float = 0.9
+    feedback_sidecar: FeedbackSidecar | None = None
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.semantic_review_threshold <= 1.0:
+            raise ValueError("semantic review threshold must be within [0, 1]")
+        if not 0.0 <= self.semantic_pass_threshold <= 1.0:
+            raise ValueError("semantic pass threshold must be within [0, 1]")
+        if self.semantic_review_threshold > self.semantic_pass_threshold:
+            raise ValueError("semantic review threshold must not exceed semantic pass threshold")
 
 
 @dataclass(frozen=True)
@@ -240,6 +251,27 @@ def validate_global_metadata(root: Path, metadata: DatasetMetadata) -> list[str]
     reparse_paths = discover_reparse_paths(root)
     if reparse_paths:
         errors.append(f"reparse_paths_present:{[str(p) for p in reparse_paths[:20]]}")
+    return errors
+
+
+def validate_feedback_global(
+    config: AuditConfig, metadata: DatasetMetadata
+) -> list[str]:
+    sidecar = config.feedback_sidecar
+    if sidecar is None:
+        return []
+    errors: list[str] = []
+    source_dataset = sidecar.manifest.get("source_dataset")
+    if source_dataset and Path(str(source_dataset)).resolve() != config.root.resolve():
+        errors.append("feedback_sidecar_dataset_mismatch")
+    expected = set(range(metadata.total_episodes))
+    actual = {episode.episode_index for episode in sidecar.episodes}
+    missing = sorted(expected.difference(actual))
+    extra = sorted(actual.difference(expected))
+    if missing:
+        errors.append(f"feedback_sidecar_missing_episodes:{missing[:20]}")
+    if extra:
+        errors.append(f"feedback_sidecar_unknown_episodes:{extra[:20]}")
     return errors
 
 
@@ -726,12 +758,25 @@ def apply_semantic_evaluation(
             return
         audit.semantic_task_profile = profile.task_key
 
-    threshold = (
+    review_threshold = (
         profile.effective_review_threshold(config.semantic_review_threshold)
         if profile is not None
         else config.semantic_review_threshold
     )
-    audit.semantic_review_threshold = threshold
+    pass_threshold = (
+        profile.effective_pass_threshold(config.semantic_pass_threshold)
+        if profile is not None
+        else config.semantic_pass_threshold
+    )
+    if review_threshold > pass_threshold:
+        audit.semantic_status = "error"
+        audit.metrics["semantic_threshold_error"] = (
+            f"review_threshold={review_threshold}>pass_threshold={pass_threshold}"
+        )
+        audit.review("semantic_threshold_configuration_invalid_review")
+        return
+    audit.semantic_review_threshold = review_threshold
+    audit.semantic_pass_threshold = pass_threshold
     videos = semantic_videos_for_episode(config, metadata, record, profile)
     if profile is not None and profile.preferred_video_keys:
         available_keys = {video.key for video in videos}
@@ -768,7 +813,7 @@ def apply_semantic_evaluation(
         audit.metrics["semantic_progress_peak"] = max(result.progress_curve)
         audit.metrics["semantic_progress_points"] = len(result.progress_curve)
 
-    if result.score < threshold:
+    if result.score < review_threshold:
         audit.semantic_status = "review"
         audit.semantic_failure_stage = (
             result.failure_stage
@@ -778,9 +823,65 @@ def apply_semantic_evaluation(
         if result.progress_curve and max(result.progress_curve) - result.progress_curve[-1] >= 0.15:
             audit.metrics["semantic_failure_type"] = "regressed_after_progress"
         audit.review("semantic_low_score_review")
+    elif result.score < pass_threshold:
+        audit.semantic_status = "review"
+        audit.semantic_failure_stage = result.failure_stage or ""
+        audit.review("semantic_uncertain_score_review")
     else:
         audit.semantic_status = "pass"
         audit.semantic_failure_stage = result.failure_stage or ""
+
+
+def apply_feedback_validation(
+    config: AuditConfig, record: EpisodeRecord, audit: EpisodeQuality
+) -> None:
+    sidecar = config.feedback_sidecar
+    if sidecar is None:
+        return
+    alignment_errors = sidecar.validate_episode_alignment(record.episode_index, record.length)
+    for error in alignment_errors:
+        audit.drop(error)
+    episode_map = {episode.episode_index: episode for episode in sidecar.episodes}
+    episode = episode_map.get(record.episode_index)
+    if episode is None:
+        return
+    frames = sidecar.frames_by_episode().get(record.episode_index, ())
+    segments = sidecar.interventions_by_episode().get(record.episode_index, ())
+    phase_counts: dict[str, int] = {}
+    for frame in frames:
+        phase = ControlPhase(frame.phase).value
+        phase_counts[phase] = phase_counts.get(phase, 0) + 1
+    capture_mode = str(
+        episode.capture_mode.value
+        if hasattr(episode.capture_mode, "value")
+        else episode.capture_mode
+    )
+    review_status = str(
+        episode.review_status.value
+        if hasattr(episode.review_status, "value")
+        else episode.review_status
+    )
+    audit.metrics.update(
+        {
+            "feedback_capture_mode": capture_mode,
+            "feedback_source_policy": episode.source_policy,
+            "feedback_outcome": episode.outcome,
+            "feedback_review_status": review_status,
+            "feedback_intervention_count": len(segments),
+            "feedback_training_eligible_frames": sum(frame.training_eligible for frame in frames),
+            "feedback_phase_counts": phase_counts,
+        }
+    )
+    if episode.outcome in {"aborted", "pending_review", "failure"}:
+        audit.review("feedback_outcome_requires_review")
+    if review_status == "pending":
+        audit.review("feedback_human_approval_required")
+    elif review_status == "rejected":
+        audit.review("feedback_human_rejected")
+    if capture_mode == "corrections_only" and not any(
+        ControlPhase(frame.phase) == ControlPhase.CORRECTION for frame in frames
+    ):
+        audit.review("feedback_correction_missing_review")
 
 
 def refresh_structural_status(audits: list[EpisodeQuality]) -> None:
@@ -810,8 +911,8 @@ def audit_episode(
         audit_numeric_data(data, metadata, record, audit, audit_state)
     audit_depth_sidecars(config, metadata, record, data, audit)
     audit_video_files(config, metadata, runtime, caches, record, audit)
+    apply_feedback_validation(config, record, audit)
     apply_semantic_evaluation(config, metadata, record, data, audit)
-    audit.skip("cup_detector_not_configured")
 
 
 def apply_distribution_reviews(audits: list[EpisodeQuality], state: AuditState) -> dict[str, float | None]:
@@ -886,12 +987,29 @@ def build_summary(
                 evaluator_name(config.semantic_evaluator) if config.semantic_evaluator is not None else None
             ),
             "review_threshold": config.semantic_review_threshold,
+            "pass_threshold": config.semantic_pass_threshold,
             "task_profiles_enabled": config.task_profiles is not None,
             "task_profile_count": len(config.task_profiles.profiles) if config.task_profiles else 0,
             "pass": sum(a.semantic_status == "pass" for a in audits),
             "review": sum(a.semantic_status == "review" for a in audits),
+            "low_score_review": sum(
+                "semantic_low_score_review" in a.review_reasons for a in audits
+            ),
+            "uncertain_score_review": sum(
+                "semantic_uncertain_score_review" in a.review_reasons for a in audits
+            ),
             "errors": sum(a.semantic_status == "error" for a in audits),
             "skipped": sum(a.semantic_status.startswith("skipped") for a in audits),
+        },
+        "feedback_validation": {
+            "enabled": config.feedback_sidecar is not None,
+            "sidecar": str(config.feedback_sidecar.root) if config.feedback_sidecar else None,
+            "episodes_with_intervention": sum(
+                int(a.metrics.get("feedback_intervention_count", 0)) > 0 for a in audits
+            ),
+            "training_eligible_frames": sum(
+                int(a.metrics.get("feedback_training_eligible_frames", 0)) for a in audits
+            ),
         },
         "ffmpeg": runtime.ffmpeg_path,
         "ffprobe": runtime.ffprobe_path,
@@ -932,6 +1050,7 @@ def run_audit(config: AuditConfig) -> int:
         return write_failure(config.out_dir, config.root, [f"cannot_read_metadata:{type(exc).__name__}:{exc}"])
 
     global_errors = validate_global_metadata(config.root, metadata)
+    global_errors.extend(validate_feedback_global(config, metadata))
     runtime = resolve_runtime(config)
     caches = AuditCaches()
     state = AuditState()
@@ -963,10 +1082,21 @@ def audit_dataset(
     semantic_evaluator: SemanticEvaluator | None = None,
     semantic_review_threshold: float = 0.5,
     task_profiles: TaskProfileRegistry | None = None,
+    semantic_pass_threshold: float = 0.9,
+    feedback_sidecar: FeedbackSidecar | Path | None = None,
 ) -> int:
     """Run the quality audit; kept for compatibility with existing utility scripts."""
     if not 0.0 <= semantic_review_threshold <= 1.0:
         raise ValueError("semantic review threshold must be within [0, 1]")
+    if not 0.0 <= semantic_pass_threshold <= 1.0:
+        raise ValueError("semantic pass threshold must be within [0, 1]")
+    if semantic_review_threshold > semantic_pass_threshold:
+        raise ValueError("semantic review threshold must not exceed semantic pass threshold")
+    resolved_feedback = (
+        FeedbackSidecar.load(feedback_sidecar)
+        if isinstance(feedback_sidecar, Path)
+        else feedback_sidecar
+    )
     config = AuditConfig(
         root=root.resolve(),
         out_dir=out_dir,
@@ -979,7 +1109,9 @@ def audit_dataset(
         video_sample_stride=video_sample_stride,
         semantic_evaluator=semantic_evaluator,
         semantic_review_threshold=semantic_review_threshold,
+        semantic_pass_threshold=semantic_pass_threshold,
         task_profiles=task_profiles,
+        feedback_sidecar=resolved_feedback,
     )
     return run_audit(config)
 
@@ -1006,12 +1138,32 @@ def main() -> None:
         default=None,
         help="optional JSON configuration passed to the evaluator plugin",
     )
-    parser.add_argument("--semantic-review-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--semantic-failure-threshold",
+        "--semantic-review-threshold",
+        dest="semantic_review_threshold",
+        metavar="SEMANTIC_FAILURE_THRESHOLD",
+        type=float,
+        default=0.5,
+        help="score below this value is reviewed as a likely semantic failure",
+    )
+    parser.add_argument(
+        "--semantic-pass-threshold",
+        type=float,
+        default=0.9,
+        help="only scores at or above this value receive automatic semantic pass",
+    )
     parser.add_argument(
         "--task-profile-dir",
         type=Path,
         default=None,
         help="optional directory containing validated task semantic profile JSON files",
+    )
+    parser.add_argument(
+        "--feedback-sidecar",
+        type=Path,
+        default=None,
+        help="optional feedback sidecar directory to validate against dataset frames",
     )
     args = parser.parse_args()
 
@@ -1039,7 +1191,9 @@ def main() -> None:
             video_sample_stride=args.video_sample_stride,
             semantic_evaluator=semantic_evaluator,
             semantic_review_threshold=args.semantic_review_threshold,
+            semantic_pass_threshold=args.semantic_pass_threshold,
             task_profiles=task_profiles,
+            feedback_sidecar=args.feedback_sidecar,
         )
     )
 

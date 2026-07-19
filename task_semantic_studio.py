@@ -23,28 +23,35 @@ DEFAULT_PARSER = "utils.task_description_parser:HeuristicTaskDescriptionParser"
 
 def build_audit_command(
     dataset: Path,
-    profile_dir: Path,
+    profile_dir: Path | None,
     evaluator_spec: str,
     out_dir: Path | None = None,
     evaluator_config: Path | None = None,
     review_threshold: float = 0.5,
     python_executable: str = sys.executable,
+    pass_threshold: float = 0.9,
 ) -> list[str]:
     if not evaluator_spec.strip():
         raise ValueError("semantic evaluator module:attribute is required")
     if not 0.0 <= review_threshold <= 1.0:
         raise ValueError("review threshold must be within [0, 1]")
+    if not 0.0 <= pass_threshold <= 1.0:
+        raise ValueError("pass threshold must be within [0, 1]")
+    if review_threshold > pass_threshold:
+        raise ValueError("review threshold must not exceed pass threshold")
     command = [
         python_executable,
         str(REPO_ROOT / "data_quality_audit.py"),
         str(dataset),
         "--semantic-evaluator",
         evaluator_spec.strip(),
-        "--semantic-review-threshold",
+        "--semantic-failure-threshold",
         str(review_threshold),
-        "--task-profile-dir",
-        str(profile_dir),
+        "--semantic-pass-threshold",
+        str(pass_threshold),
     ]
+    if profile_dir is not None:
+        command.extend(["--task-profile-dir", str(profile_dir)])
     if out_dir is not None:
         command.extend(["--out-dir", str(out_dir)])
     if evaluator_config is not None:
@@ -63,12 +70,13 @@ class TaskSemanticStudio:
         self.task_key = tk.StringVar()
         self.parser_spec = tk.StringVar(value=DEFAULT_PARSER)
         self.parser_config = tk.StringVar()
-        self.profile_dir = tk.StringVar(value=str(REPO_ROOT / "task_profiles"))
+        self.profile_dir = tk.StringVar()
         self.dataset = tk.StringVar()
         self.report_dir = tk.StringVar()
         self.evaluator_spec = tk.StringVar()
         self.evaluator_config = tk.StringVar()
         self.review_threshold = tk.StringVar(value="0.5")
+        self.pass_threshold = tk.StringVar(value="0.9")
         self.status = tk.StringVar(value="Ready")
         self.run_button: ttk.Button | None = None
 
@@ -124,7 +132,13 @@ class TaskSemanticStudio:
         audit.columnconfigure(1, weight=1)
         audit.columnconfigure(4, weight=1)
         self._path_row(audit, 0, "Dataset", self.dataset, self._browse_dataset)
-        self._path_row(audit, 1, "Profile directory", self.profile_dir, self._browse_profile_dir)
+        self._path_row(
+            audit,
+            1,
+            "Task Profile directory (optional)",
+            self.profile_dir,
+            self._browse_profile_dir,
+        )
         self._path_row(audit, 2, "Report directory", self.report_dir, self._browse_report_dir)
         ttk.Label(audit, text="Evaluator module:attribute").grid(row=3, column=0, sticky="w")
         ttk.Entry(audit, textvariable=self.evaluator_spec).grid(
@@ -133,8 +147,12 @@ class TaskSemanticStudio:
         ttk.Label(audit, text="Evaluator config JSON").grid(row=3, column=3, sticky="w")
         ttk.Entry(audit, textvariable=self.evaluator_config).grid(row=3, column=4, sticky="ew", padx=6)
         ttk.Button(audit, text="Browse", command=self._browse_evaluator_config).grid(row=3, column=5)
-        ttk.Label(audit, text="Default review threshold").grid(row=4, column=0, sticky="w")
+        ttk.Label(audit, text="Likely failure threshold").grid(row=4, column=0, sticky="w")
         ttk.Entry(audit, textvariable=self.review_threshold, width=12).grid(row=4, column=1, sticky="w", padx=6)
+        ttk.Label(audit, text="Automatic pass threshold").grid(row=4, column=3, sticky="w")
+        ttk.Entry(audit, textvariable=self.pass_threshold, width=12).grid(
+            row=4, column=4, sticky="w", padx=6
+        )
         self.run_button = ttk.Button(audit, text="Run audit", command=self.run_audit)
         self.run_button.grid(row=4, column=5, sticky="e")
 
@@ -237,7 +255,13 @@ class TaskSemanticStudio:
     def save_profile(self) -> None:
         try:
             profile = self._profile_from_editor()
-            directory = Path(self.profile_dir.get()).expanduser()
+            directory_value = self.profile_dir.get().strip()
+            if not directory_value:
+                directory_value = filedialog.askdirectory(title="Select directory for task profiles")
+                if not directory_value:
+                    return
+                self.profile_dir.set(directory_value)
+            directory = Path(directory_value).expanduser()
             path = directory / f"{profile.task_key}.json"
             profile.save(path)
             self.status.set(f"Saved {path}")
@@ -248,7 +272,9 @@ class TaskSemanticStudio:
     def run_audit(self) -> None:
         try:
             dataset = Path(self.dataset.get()).expanduser()
-            profile_dir = Path(self.profile_dir.get()).expanduser()
+            profile_dir = (
+                Path(self.profile_dir.get()).expanduser() if self.profile_dir.get().strip() else None
+            )
             report_dir = Path(self.report_dir.get()).expanduser() if self.report_dir.get().strip() else None
             evaluator_config = (
                 Path(self.evaluator_config.get()).expanduser()
@@ -262,10 +288,11 @@ class TaskSemanticStudio:
                 out_dir=report_dir,
                 evaluator_config=evaluator_config,
                 review_threshold=float(self.review_threshold.get()),
+                pass_threshold=float(self.pass_threshold.get()),
             )
             if not dataset.is_dir():
                 raise FileNotFoundError(f"dataset directory not found: {dataset}")
-            if not profile_dir.is_dir():
+            if profile_dir is not None and not profile_dir.is_dir():
                 raise FileNotFoundError(f"profile directory not found: {profile_dir}")
         except Exception as exc:
             messagebox.showerror("Cannot run audit", str(exc))

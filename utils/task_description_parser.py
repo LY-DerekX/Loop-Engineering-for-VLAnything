@@ -176,10 +176,23 @@ class HeuristicTaskDescriptionParser:
 
     name = "heuristic_task_description_parser"
 
-    def __init__(self, review_threshold: float | None = None) -> None:
+    def __init__(
+        self,
+        review_threshold: float | None = None,
+        pass_threshold: float | None = None,
+    ) -> None:
         if review_threshold is not None and not 0.0 <= review_threshold <= 1.0:
             raise ValueError("review_threshold must be within [0, 1]")
+        if pass_threshold is not None and not 0.0 <= pass_threshold <= 1.0:
+            raise ValueError("pass_threshold must be within [0, 1]")
+        if (
+            review_threshold is not None
+            and pass_threshold is not None
+            and review_threshold > pass_threshold
+        ):
+            raise ValueError("review_threshold must not exceed pass_threshold")
         self.review_threshold = review_threshold
+        self.pass_threshold = pass_threshold
 
     def parse(
         self,
@@ -251,6 +264,7 @@ class HeuristicTaskDescriptionParser:
             success_criteria=success,
             failure_criteria=failure,
             review_threshold=self.review_threshold,
+            pass_threshold=self.pass_threshold,
             notes=(
                 "由本地启发式解析器生成的草稿；运行语义质检前请人工确认。"
                 if chinese

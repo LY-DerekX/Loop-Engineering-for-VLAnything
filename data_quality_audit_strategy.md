@@ -367,6 +367,26 @@ dropped_episodes
 drop_reasons
 ```
 
+### 9.1 Human Feedback Sidecars
+
+Policy feedback must keep control provenance outside the standard dataset
+schema. When `--feedback-sidecar` is supplied, the deterministic audit also
+checks:
+
+```text
+sidecar source dataset matches the audited dataset
+every dataset episode has matching feedback metadata
+feedback frame count equals episode length
+feedback frame_index is contiguous and episode-local
+Recovery/Correction ranges are ordered and match frame phase labels
+human-controlled frames have intervention ids and executed actions
+only Recovery/Correction frames are training-eligible by default
+```
+
+New feedback is `pending` and therefore enters review until a human approval
+list is recorded. Autonomous failures remain analysis data and must not be
+treated as expert action targets by the feedback dataset builder.
+
 ## 10. Suggested CLI
 
 Audit:
@@ -811,6 +831,24 @@ reviewed_episodes
 dropped_episodes
 drop_reasons
 ```
+
+### 9.1 人工反馈 Sidecar
+
+策略反馈应把控制来源保存在标准数据集 schema 之外。传入
+`--feedback-sidecar` 后，确定性质检还会检查：
+
+```text
+sidecar 的 source dataset 与被审计数据集一致
+每个 dataset episode 都存在反馈 metadata
+反馈帧数与 episode length 一致
+frame_index 在 episode 内连续
+Recovery/Correction 区间有序且与逐帧 phase 一致
+人工控制帧具有 intervention id 和 executed action
+默认只有 Recovery/Correction 帧可作为训练目标
+```
+
+新采集反馈默认为 `pending`，必须进入人工 review。自主失败动作只用于
+分析，反馈训练集构建器不得把它们作为专家动作标签。
 
 ## 10. 建议命令行接口
 
