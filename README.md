@@ -272,6 +272,57 @@ python .\data_quality_audit.py .\lerobot_derek_depth `
   --depth-sample-frames 8
 ```
 
+## Optional Semantic Quality Evaluation
+
+The deterministic audit can optionally call a project-defined semantic
+evaluator. The base installation does not download model weights and remains
+fully usable when no evaluator is configured.
+
+An evaluator receives the task text plus episode-scoped video files and their
+start/end timestamps. It returns a normalized progress curve, a final success
+probability, and optionally a named failure stage:
+
+~~~python
+class MySemanticEvaluator:
+    name = "my_video_language_evaluator"
+
+    def evaluate(self, episode):
+        # Run an external or local video-language scoring model here.
+        return {
+            "progress_curve": [0.05, 0.30, 0.62],
+            "success_probability": 0.41,
+            "failure_stage": "grasp",
+            "details": {"model_revision": "local"},
+        }
+~~~
+
+Expose either an evaluator instance, an evaluator class, or a factory from a
+Python module, then enable it with module:attribute syntax:
+
+~~~powershell
+python ./data_quality_audit.py ./lerobot_derek_depth --semantic-evaluator my_quality_backend:create_evaluator --semantic-config ./semantic_evaluator.json --semantic-review-threshold 0.5
+~~~
+
+The evaluator configuration file is optional and must contain one JSON object.
+Classes receive the object as keyword arguments; factories receive it as one
+dictionary.
+
+Semantic output is added directly to quality_report.csv:
+
+- semantic_progress_curve_json
+- semantic_progress_final
+- semantic_success_probability
+- semantic_score
+- semantic_failure_stage
+- semantic_status and semantic_evaluator
+
+Success probability is used as the review score when provided; otherwise the
+last progress value is used. A score below the configured threshold adds
+semantic_low_score_review and never turns a trajectory into a hard drop.
+Evaluator errors also go to review so model failures cannot silently approve
+data. Episodes already marked drop by deterministic checks skip semantic
+inference.
+
 ## Check Completeness
 
 Use `utils/dataset_completeness_check.py` for structure-only validation after merging or cleaning.

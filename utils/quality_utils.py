@@ -23,6 +23,14 @@ class EpisodeQuality:
     length: int = 0
     data_rows: int = 0
     depth_files: int = 0
+    structural_status: str = "keep"
+    semantic_status: str = "not_checked"
+    semantic_evaluator: str = ""
+    semantic_progress_curve: list[float] = field(default_factory=list)
+    semantic_progress_final: float | None = None
+    semantic_success_probability: float | None = None
+    semantic_score: float | None = None
+    semantic_failure_stage: str = ""
     status: str = "keep"
     drop_reasons: list[str] = field(default_factory=list)
     review_reasons: list[str] = field(default_factory=list)
@@ -151,6 +159,14 @@ def write_quality_outputs(out_dir: Path, audits: list[EpisodeQuality], summary: 
     fields = [
         "episode_index",
         "status",
+        "structural_status",
+        "semantic_status",
+        "semantic_evaluator",
+        "semantic_progress_curve_json",
+        "semantic_progress_final",
+        "semantic_success_probability",
+        "semantic_score",
+        "semantic_failure_stage",
         "length",
         "data_rows",
         "depth_files",
@@ -165,6 +181,20 @@ def write_quality_outputs(out_dir: Path, audits: list[EpisodeQuality], summary: 
         for audit in audits:
             writer.writerow(
                 {
+                    "structural_status": audit.structural_status,
+                    "semantic_status": audit.semantic_status,
+                    "semantic_evaluator": audit.semantic_evaluator,
+                    "semantic_progress_curve_json": json.dumps(audit.semantic_progress_curve),
+                    "semantic_progress_final": (
+                        "" if audit.semantic_progress_final is None else audit.semantic_progress_final
+                    ),
+                    "semantic_success_probability": (
+                        ""
+                        if audit.semantic_success_probability is None
+                        else audit.semantic_success_probability
+                    ),
+                    "semantic_score": "" if audit.semantic_score is None else audit.semantic_score,
+                    "semantic_failure_stage": audit.semantic_failure_stage,
                     "episode_index": audit.episode_index,
                     "status": audit.status,
                     "length": audit.length,
