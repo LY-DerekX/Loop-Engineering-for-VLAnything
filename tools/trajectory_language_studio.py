@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def build_enrichment_command(
@@ -31,7 +31,7 @@ def build_enrichment_command(
         raise ValueError("language annotator module:attribute is required")
     command = [
         python_executable,
-        str(REPO_ROOT / "trajectory_language_enrichment.py"),
+        str(REPO_ROOT / "pipeline" / "trajectory_language_enrichment.py"),
         str(dataset),
         "--annotator",
         annotator_spec.strip(),

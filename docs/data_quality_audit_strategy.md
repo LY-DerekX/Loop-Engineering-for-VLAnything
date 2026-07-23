@@ -394,7 +394,7 @@ Audit:
 ```powershell
 conda activate vla_data_check
 cd /d F:\Lerobot\hf_depth_vla_datasets
-python .\data_quality_audit.py `
+python .pipelinedata_quality_audit.py `
   .\determ_lerobot_rgb_depth_vla `
   --out-dir .\quality_audit_reports\determ_lerobot_rgb_depth_vla `
   --depth-check header `
@@ -409,13 +409,13 @@ Verify existing dataset integrity:
 ```powershell
 conda activate vla_data_check
 cd /d F:\Lerobot\hf_depth_vla_datasets
-python .\utils\dataset_completeness_check.py .\determ_lerobot_rgb_depth_vla
+python .	oolsdataset_completeness_check.py .\determ_lerobot_rgb_depth_vla
 ```
 
 Generate a cleaned dataset after review:
 
 ```powershell
-python .\dataset_clean_build.py `
+python .pipelinedataset_clean_build.py `
   .\determ_lerobot_rgb_depth_vla `
   --drop-list .\quality_audit_reports\determ_lerobot_rgb_depth_vla\drop_episodes.txt `
   --out-dir .\determ_lerobot_rgb_depth_vla_clean `
@@ -857,7 +857,7 @@ Recovery/Correction 区间有序且与逐帧 phase 一致
 ```powershell
 conda activate vla_data_check
 cd /d F:\Lerobot\hf_depth_vla_datasets
-python .\data_quality_audit.py `
+python .pipelinedata_quality_audit.py `
   .\determ_lerobot_rgb_depth_vla `
   --out-dir .\quality_audit_reports\determ_lerobot_rgb_depth_vla `
   --depth-check header `
@@ -872,13 +872,13 @@ python .\data_quality_audit.py `
 ```powershell
 conda activate vla_data_check
 cd /d F:\Lerobot\hf_depth_vla_datasets
-python .\utils\dataset_completeness_check.py .\determ_lerobot_rgb_depth_vla
+python .	oolsdataset_completeness_check.py .\determ_lerobot_rgb_depth_vla
 ```
 
 人工复核后生成清洗数据集：
 
 ```powershell
-python .\dataset_clean_build.py `
+python .pipelinedataset_clean_build.py `
   .\determ_lerobot_rgb_depth_vla `
   --drop-list .\quality_audit_reports\determ_lerobot_rgb_depth_vla\drop_episodes.txt `
   --out-dir .\determ_lerobot_rgb_depth_vla_clean `

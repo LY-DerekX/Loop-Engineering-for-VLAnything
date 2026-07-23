@@ -14,8 +14,8 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from dataset_clean_build import build_clean_dataset
-from dataset_merge import run_merge_paths
+from pipeline.dataset_clean_build import build_clean_dataset
+from pipeline.dataset_merge import run_merge_paths
 from policy_improvement.contracts import ControlPhase, FeedbackSidecar
 from utils.dataset_io import read_json
 from utils.quality_utils import parse_episode_list

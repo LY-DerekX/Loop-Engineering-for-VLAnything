@@ -10,11 +10,11 @@ The toolkit is designed for Orbbec RGB-D collection, merging multiple same-struc
 
 It also includes separate LeRobot-side collection paths:
 
-- `rgb_record/`: RGB-only recording overlay using the official Hugging Face LeRobot repository.
-- `rgbd_record/`: Orbbec RGB-D recording overlay that can be copied into the official Hugging Face LeRobot repository.
-- `visuo-tactile_record/`: visuo-tactile (vision + touch) recording overlay, in progress.
+- `record/rgb_record/`: RGB-only recording overlay using the official Hugging Face LeRobot repository.
+- `record/rgbd_record/`: Orbbec RGB-D recording overlay that can be copied into the official Hugging Face LeRobot repository.
+- `record/visuo-tactile_record/`: visuo-tactile (vision + touch) recording overlay, in progress.
 
-The official LeRobot project is here: https://github.com/huggingface/lerobot. The visuo-tactile data collection pipeline under `visuo-tactile_record/` is in progress, and its dataset and toolkit will be released open source when ready.
+The official LeRobot project is here: https://github.com/huggingface/lerobot. The visuo-tactile data collection pipeline under `record/visuo-tactile_record/` is in progress, and its dataset and toolkit will be released open source when ready.
 
 ## Dataset
 
@@ -67,12 +67,41 @@ Aligned episode overview matrices:
 | --- |
 | ![Front depth episode matrix](assets/readme/depth_episode_matrix.png) |
 
+## Repository Layout
+
+The repository is organized by role:
+
+```text
+pipeline/               # production entry points: merge, audit, clean, feedback build,
+                        #   language enrichment, policy iteration, HF upload
+record/                 # recording overlays, copied into a LeRobot checkout:
+                        #   camera_profiles.yaml/.py (shared camera inventory + resolver),
+                        #   rgb_record/ (RGB-only), rgbd_record/ (Orbbec / RealSense RGB-D),
+                        #   visuo-tactile_record/ (vision + touch, in progress)
+tools/                  # local studios, depth visualization, structure-only checks
+utils/                  # shared audit, metadata, media, and semantic helpers
+policy_improvement/     # feedback capture, intervention, and policy iteration contracts
+tests/                  # unit tests with synthetic datasets
+configs/                # example configuration files
+docs/                   # audit strategy and step-by-step operating playbook
+assets/                 # README media
+data/                   # local datasets (not tracked by git)
+```
+
+Offline pipeline modules never import LeRobot or camera SDKs. Robot-side
+dependencies stay inside `record/`, which is copied into a LeRobot checkout and
+used from there.
+
+Structural reports store a dataset fingerprint. `--semantic-only` refuses
+to reuse a report when audit-relevant metadata or payload file identity has
+changed.
+
 ## Overview
 
 Main capabilities:
 
 - collect stock RGB-only LeRobot datasets through the official LeRobot recorder;
-- collect Orbbec RGB-D data through a LeRobot overlay;
+- collect RGB-D data through a LeRobot overlay with switchable cameras (Orbbec Femto Bolt, Intel RealSense D405/D435);
 - merge multiple LeRobot-style datasets into one physical dataset;
 - keep the output as real files, not junctions or symbolic links;
 - rewrite episode indices, frame indices, task indices, metadata, parquet tables, video references, and depth sidecars;
@@ -108,6 +137,9 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+Robot-side RGB-D dependencies are installed inside the LeRobot capture
+environment, not here; see the recording sections below.
+
 Full video decoding and video trimming require `ffmpeg` and `ffprobe` command-line tools. If they are not already available in the environment, install them with conda:
 
 ```powershell
@@ -127,7 +159,7 @@ $env:HF_XET_HIGH_PERFORMANCE="1"
 Folder:
 
 ```text
-rgb_record/
+record/rgb_record/
 ```
 
 Purpose: provide a copy-in RGB-only recording overlay for the official LeRobot repository. This folder is separate from `rgbd_record/` because RGB-only collection should not depend on the Orbbec RGB-D overlay.
@@ -142,7 +174,9 @@ Copy the folder into a LeRobot checkout:
 
 ```powershell
 $LEROBOT_ROOT="E:\path\to\lerobot"
-Copy-Item -Recurse -Force .\rgb_record $LEROBOT_ROOT\
+Copy-Item -Recurse -Force .\record\rgb_record $LEROBOT_ROOT\
+Copy-Item -Force .\record\camera_profiles.yaml $LEROBOT_ROOT\
+Copy-Item -Force .\record\camera_profiles.py $LEROBOT_ROOT\
 ```
 
 Install and find cameras from the LeRobot root:
@@ -162,17 +196,19 @@ python .\rgb_record\rgb_record.py `
 
 The output is a standard LeRobot RGB dataset with `data/`, `meta/`, and `videos/`. It should not contain `depth_sidecar/`. After recording, point this toolkit's merge, audit, clean, and upload scripts at the dataset root.
 
-## Orbbec RGB-D Data Collection
+## RGB-D Data Collection (Orbbec / RealSense)
 
 Folder:
 
 ```text
-rgbd_record/
+record/rgbd_record/
 ```
 
-Purpose: add Orbbec Femto Bolt RGB-D recording to a LeRobot checkout. This makes the pipeline cover capture -> merge -> audit -> clean -> upload.
+Purpose: add RGB-D recording to a LeRobot checkout with an Orbbec Femto Bolt or an Intel RealSense D405 / D435 / D435i camera. This makes the pipeline cover capture -> merge -> audit -> clean -> upload.
 
-Scope: this folder is for data collection only. It provides an Orbbec camera backend, RGB-D recording scripts, and depth sidecar storage helpers. It does not contain this project's depth model training or inference implementation.
+Camera hardware facts (backend type, serial number, resolution, depth on/off) are defined once in the shared inventory `record/camera_profiles.yaml`, which serves all recording paths (RGB, RGB-D, visuo-tactile). At record time, `--camera_profile=<name>` swaps the whole camera set without touching the record config; supported backends are `orbbec`, `intelrealsense` (D405/D435), and `opencv`, and any camera with `use_depth: true` contributes a uint16 PNG depth sidecar stream. Cameras can also stay inline in the recording YAML: `record_rgbd.yaml` ships with the Orbbec block active and RealSense variants commented; `record_rgbd_realsense.yaml` is a ready-to-run all-RealSense rig (D435 front + D405 wrist).
+
+Scope: this folder is for data collection only. It provides an Orbbec camera backend, RealSense-compatible depth wiring in the SO follower, RGB-D recording scripts, and depth sidecar storage helpers. It does not contain this project's depth model training or inference implementation.
 
 The capture overlay is designed to be copied directly into the official Hugging Face LeRobot repository and used from there:
 
@@ -186,9 +222,11 @@ Do not copy `rgbd_record/` as a nested subfolder under LeRobot. Merge its conten
 
 ```powershell
 $LEROBOT_ROOT="E:\path\to\lerobot"
-Copy-Item -Recurse -Force .\rgbd_record\examples $LEROBOT_ROOT\
-Copy-Item -Recurse -Force .\rgbd_record\src $LEROBOT_ROOT\
-Copy-Item -Force .\rgbd_record\pyproject.toml $LEROBOT_ROOT\
+Copy-Item -Recurse -Force .\record\rgbd_record\examples $LEROBOT_ROOT\
+Copy-Item -Recurse -Force .\record\rgbd_record\src $LEROBOT_ROOT\
+Copy-Item -Force .\record\rgbd_record\pyproject.toml $LEROBOT_ROOT\
+Copy-Item -Force .\record\camera_profiles.yaml $LEROBOT_ROOT\
+Copy-Item -Force .\record\camera_profiles.py $LEROBOT_ROOT\
 Copy-Item -Recurse -Force .\policy_improvement $LEROBOT_ROOT\
 ```
 
@@ -206,19 +244,23 @@ Install inside the LeRobot repo root:
 
 ```powershell
 cd $LEROBOT_ROOT
-python -m pip install -e ".[feetech,orbbec,rgbd_vla]" -e .\examples\rgbd_vla_depth
+python -m pip install -e ".[feetech,orbbec,intelrealsense,rgbd_vla]" -e .\examples\rgbd_vla_depth
 ```
 
-Find the Orbbec camera:
+Drop `orbbec` or `intelrealsense` from the extras when that camera family is not used.
+
+Find the cameras:
 
 ```powershell
 lerobot-find-cameras orbbec
+lerobot-find-cameras realsense
 ```
 
-Write the camera serial and robot ports into:
+Write the camera serials and robot ports into:
 
 ```text
-examples/rgbd_vla_depth/configs/record_rgbd.yaml
+examples/rgbd_vla_depth/configs/record_rgbd.yaml            # switchable: Orbbec active, RealSense variants commented
+examples/rgbd_vla_depth/configs/record_rgbd_realsense.yaml  # all-RealSense: D435 front + D405 wrist
 ```
 
 Record:
@@ -234,7 +276,7 @@ Depth is saved as lossless uint16 PNG sidecars under `depth_sidecar/`, with a re
 Use `dataset_merge.py` to merge multiple `*_dataset` folders into one real LeRobot dataset.
 
 ```powershell
-python .\dataset_merge.py `
+python ./pipeline/dataset_merge.py `
   --src-root . `
   --out-dir .\lerobot_derek_depth `
   --dataset-glob "*_dataset" `
@@ -244,7 +286,7 @@ python .\dataset_merge.py `
 Overwrite an existing output:
 
 ```powershell
-python .\dataset_merge.py --out-dir .\lerobot_derek_depth --overwrite
+python ./pipeline/dataset_merge.py --out-dir .\lerobot_derek_depth --overwrite
 ```
 
 ## Audit Dataset Quality
@@ -254,7 +296,7 @@ Use `data_quality_audit.py` to run conservative quality checks. Hard determinist
 RGB is in scope. The audit checks RGB video existence, real-file status, empty files, ffprobe dimensions/codec when available, full ffmpeg decode when requested, and sampled black/white/near-constant/frozen video content. Existing RGB-only LeRobot datasets do not need a `depth_sidecar/` directory. When depth sidecars are present, the audit checks them separately through PNG structure, dimensions, optional full decode, invalid-depth ratio, and constant-depth samples.
 
 ```powershell
-python .\data_quality_audit.py .\lerobot_derek_depth
+python ./pipeline/data_quality_audit.py .\lerobot_derek_depth
 ```
 
 Default audit output:
@@ -271,7 +313,7 @@ quality_audit_reports/lerobot_derek_depth/
 Run with video decode and sampled content checks:
 
 ```powershell
-python .\data_quality_audit.py .\lerobot_derek_depth `
+python ./pipeline/data_quality_audit.py .\lerobot_derek_depth `
   --depth-check header `
   --video-check decode `
   --video-content-check sample `
@@ -285,7 +327,7 @@ Use the local task window to turn a detailed natural-language description into
 a validated, editable semantic profile:
 
 ~~~powershell
-python ./task_semantic_studio.py
+python ./tools/task_semantic_studio.py
 ~~~
 
 The Profile directory is optional when running an audit. Leave it blank to
@@ -359,7 +401,7 @@ Expose either an evaluator instance, an evaluator class, or a factory from a
 Python module, then enable it with module:attribute syntax:
 
 ~~~powershell
-python ./data_quality_audit.py ./lerobot_derek_depth --semantic-evaluator my_quality_backend:create_evaluator --semantic-config ./semantic_evaluator.json --semantic-failure-threshold 0.5 --semantic-pass-threshold 0.9
+python ./pipeline/data_quality_audit.py ./lerobot_derek_depth --semantic-evaluator my_quality_backend:create_evaluator --semantic-config ./semantic_evaluator.json --semantic-failure-threshold 0.5 --semantic-pass-threshold 0.9
 ~~~
 
 `--semantic-review-threshold` remains accepted as a compatibility alias for
@@ -415,6 +457,46 @@ continue sampling high-scoring episodes for manual review. Evaluator errors
 also go to review so model failures cannot silently approve data. Episodes
 already marked drop by deterministic checks skip semantic inference.
 
+### Staged Audits: Reuse the Structural Report
+
+Deterministic checks are cheap to re-run; semantic evaluation is the expensive
+layer. For day-to-day iteration, run them as two stages instead of one pass:
+
+1. Run the deterministic audit alone (no `--semantic-evaluator`). Fix
+   structural problems, rebuild, and re-run until the dataset is structurally
+   clean.
+2. Re-run only the semantic layer on top of the saved report:
+
+~~~powershell
+python ./pipeline/data_quality_audit.py ./lerobot_derek_depth `
+  --semantic-only `
+  --semantic-evaluator my_quality_backend:create_evaluator `
+  --semantic-failure-threshold 0.5 `
+  --semantic-pass-threshold 0.9
+~~~
+
+`--semantic-only` reloads `<out-dir>/quality_report.csv` (override the source
+with `--reuse-report path/to/quality_report.csv`), preserves every structural
+finding, strips prior semantic results, and evaluates only episodes that are
+not already structural drops. The merged report overwrites
+`quality_report.csv` and the keep/review/drop lists, and
+`quality_summary.json` records `audit_mode: semantic_reuse` together with the
+reused report path.
+
+Safety rules in this mode:
+
+- the dataset must be unchanged since the reused report was produced: the
+  episode set, per-episode lengths, and the dataset path recorded in the prior
+  `quality_summary.json` are re-checked, and any mismatch fails the run
+  instead of producing a stale report;
+- `--feedback-sidecar` is rejected because feedback alignment is a structural
+  check; run it in stage 1;
+- before publishing a dataset, run one final full audit in a single pass so
+  the released report does not depend on report reuse.
+
+The step-by-step operating procedure with commands is in
+[docs/audit_operations_playbook.md](docs/audit_operations_playbook.md).
+
 ## Trajectory Language Enrichment
 
 The third layer describes what happens inside an approved trajectory; it does
@@ -436,14 +518,14 @@ flowchart TD
 Launch the local setup window:
 
 ~~~powershell
-python ./trajectory_language_studio.py
+python ./tools/trajectory_language_studio.py
 ~~~
 
 Or call the processor directly. The quality report defaults to
 `quality_audit_reports/<dataset_name>/quality_report.csv` when omitted:
 
 ~~~powershell
-python ./trajectory_language_enrichment.py ./robot_dataset `
+python ./pipeline/trajectory_language_enrichment.py ./robot_dataset `
   --quality-report ./quality_audit_reports/robot_dataset/quality_report.csv `
   --task-profile-dir ./task_profiles `
   --annotator my_language_backend:create_annotator `
@@ -581,7 +663,7 @@ actually sent to the robot.
 Pass the feedback sidecar into the existing deterministic and semantic audit:
 
 ~~~powershell
-python ./data_quality_audit.py ./data/so100_rgbd_feedback `
+python ./pipeline/data_quality_audit.py ./data/so100_rgbd_feedback `
   --feedback-sidecar ./feedback_outputs/so100_rgbd_feedback/session-001 `
   --semantic-evaluator my_quality_backend:create_evaluator `
   --semantic-failure-threshold 0.5 `
@@ -609,7 +691,7 @@ After review and optional language enrichment, build a new physical training
 dataset:
 
 ~~~powershell
-python ./feedback_dataset_build.py `
+python ./pipeline/feedback_dataset_build.py `
   --base-dataset ./data/original_clean_dataset `
   --feedback-dataset ./data/so100_rgbd_feedback `
   --feedback-sidecar ./feedback_outputs/so100_rgbd_feedback/session-001 `
@@ -688,7 +770,7 @@ class MyDeployer:
 Run one iteration from a JSON configuration:
 
 ~~~powershell
-python ./policy_iteration.py ./configs/policy_iteration.example.json
+python ./pipeline/policy_iteration.py ./configs/policy_iteration.example.json
 ~~~
 
 Promotion requires the configured success rate, intervention rate, critical
@@ -703,7 +785,7 @@ accidental persistence of credentials.
 Use `utils/dataset_completeness_check.py` for structure-only validation after merging or cleaning.
 
 ```powershell
-python .\utils\dataset_completeness_check.py .\lerobot_derek_depth
+python ./tools/dataset_completeness_check.py .\lerobot_derek_depth
 ```
 
 ## Build a Clean Dataset
@@ -718,7 +800,7 @@ Recommended workflow:
 4. Build the clean dataset.
 
 ```powershell
-python .\dataset_clean_build.py `
+python ./pipeline/dataset_clean_build.py `
   .\lerobot_derek_depth `
   --drop-list .\quality_audit_reports\lerobot_derek_depth\drop_episodes.txt `
   --out-dir .\lerobot_derek_depth_clean `
@@ -752,20 +834,20 @@ HF_DATASET_NAME = "your_dataset_name"
 Always run a dry run first:
 
 ```powershell
-python .\hf_push.py --dry-run
+python ./pipeline/hf_push.py --dry-run
 ```
 
 Upload:
 
 ```powershell
 $env:HF_XET_HIGH_PERFORMANCE="1"
-python .\hf_push.py
+python ./pipeline/hf_push.py
 ```
 
 Upload a cleaned dataset instead:
 
 ```powershell
-python .\hf_push.py `
+python ./pipeline/hf_push.py `
   --dataset-dir .\lerobot_derek_depth_clean `
   --dataset-name lerobot_derek_depth_clean
 ```
@@ -777,13 +859,13 @@ Use `depth_visualize.py` to inspect depth PNG statistics or generate visualizati
 Print statistics:
 
 ```powershell
-python .\depth_visualize.py .\lerobot_derek_depth\depth_sidecar --stats
+python ./tools/depth_visualize.py .\lerobot_derek_depth\depth_sidecar --stats
 ```
 
 Generate visualization images:
 
 ```powershell
-python .\depth_visualize.py .\lerobot_derek_depth\depth_sidecar --out .\depth_vis
+python ./tools/depth_visualize.py .\lerobot_derek_depth\depth_sidecar --out .\depth_vis
 ```
 
 ## Run Tests

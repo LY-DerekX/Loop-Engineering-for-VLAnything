@@ -197,6 +197,7 @@ class SOFollower(Robot):
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
             # Depth frame for RGB-D cameras that expose the RealSense-compatible depth buffer contract.
+            # Orbbec stores depth as (H, W); RealSense stores it as (H, W, 1) — normalize to (H, W, 1).
             if getattr(cam, "use_depth", False):
                 start = time.perf_counter()
                 frame_lock = getattr(cam, "frame_lock", None)
@@ -206,7 +207,9 @@ class SOFollower(Robot):
                     with frame_lock:
                         depth = getattr(cam, "latest_depth_frame", None)
                 if depth is not None:
-                    obs_dict[f"{cam_key}_depth"] = depth[:, :, None]
+                    if depth.ndim == 2:
+                        depth = depth[:, :, None]
+                    obs_dict[f"{cam_key}_depth"] = depth
                 dt_ms = (time.perf_counter() - start) * 1e3
                 logger.debug(f"{self} read {cam_key} depth: {dt_ms:.1f}ms")
 

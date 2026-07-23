@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from data_quality_audit import audit_dataset  # noqa: E402
+from pipeline.data_quality_audit import audit_dataset  # noqa: E402
 from utils.quality_utils import DEFAULT_REPORT_DIR  # noqa: E402
 
 
