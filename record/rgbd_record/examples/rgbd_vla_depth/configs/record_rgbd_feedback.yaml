@@ -3,6 +3,9 @@ robot:
   id: so100_rgbd_follower
   port: /dev/ttyACM0
   use_degrees: true
+  # Cameras are switchable exactly like in record_rgbd.yaml: set `type` to
+  # orbbec, intelrealsense (D405/D435), or opencv per camera. See the
+  # commented variants in record_rgbd.yaml for ready-made blocks.
   cameras:
     front:
       type: orbbec
@@ -15,12 +18,26 @@ robot:
       depth_width: 640
       depth_height: 576
       align_depth_to_color: true
+    # front:
+    #   type: intelrealsense
+    #   serial_number_or_name: "REPLACE_WITH_D435_SERIAL"
+    #   fps: 30
+    #   width: 848
+    #   height: 480
+    #   use_depth: true
     wrist:
       type: opencv
       index_or_path: /dev/video0
       fps: 30
       width: 640
       height: 480
+    # wrist:
+    #   type: intelrealsense
+    #   serial_number_or_name: "REPLACE_WITH_D405_SERIAL"
+    #   fps: 30
+    #   width: 640
+    #   height: 480
+    #   use_depth: true
 teleop:
   type: so100_leader
   id: so100_leader

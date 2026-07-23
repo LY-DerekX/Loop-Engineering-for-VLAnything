@@ -37,8 +37,15 @@ From this toolkit repository:
 
 ```powershell
 $LEROBOT_ROOT="E:\path\to\lerobot"
-Copy-Item -Recurse -Force .\rgb_record $LEROBOT_ROOT\
+Copy-Item -Recurse -Force .\record\rgb_record $LEROBOT_ROOT\
+Copy-Item -Force .\record\camera_profiles.yaml $LEROBOT_ROOT\
+Copy-Item -Force .\record\camera_profiles.py $LEROBOT_ROOT\
 ```
+
+`camera_profiles.yaml` is the shared camera inventory used by every recording
+path (RGB, RGB-D, visuo-tactile). It is optional here: without
+`--camera_profile`, the inline `cameras:` block in the record config is used
+unchanged.
 
 Then work from the LeRobot root:
 
@@ -91,6 +98,18 @@ python .\rgb_record\rgb_record.py `
   --dataset.num_episodes=5 `
   --dataset.single_task="Pick up the cup"
 ```
+
+Select the cameras from the shared inventory instead of the inline block:
+
+```powershell
+python .\rgb_record\rgb_record.py `
+  --config_path=.\rgb_record\configs\head_wrist_rgb_record.yaml `
+  --camera_profile=rgb_head_wrist
+```
+
+The selected profile replaces `robot.cameras`; every other record field stays
+as configured. Profiles that enable `use_depth` are rejected on this RGB-only
+path with a pointer to `rgbd_record/`.
 
 Replace `COM5`, `COM6`, camera indices, resolution, FPS, repository ID, episode count, and task text with the values for the real setup.
 

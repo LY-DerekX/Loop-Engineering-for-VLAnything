@@ -7,12 +7,12 @@ import unittest
 from pathlib import Path
 
 from tests.test_dataset_etl_pipeline import write_rgb_dataset
-from trajectory_language_enrichment import (
+from pipeline.trajectory_language_enrichment import (
     LanguageEnrichmentConfig,
     run_language_enrichment,
     select_episode_indices,
 )
-from trajectory_language_studio import build_enrichment_command
+from tools.trajectory_language_studio import build_enrichment_command
 from utils.language_annotation_profile import (
     LanguageAnnotationEpisode,
     normalize_annotation_result,

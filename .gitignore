@@ -11,6 +11,7 @@ policy_iteration_outputs/
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
 
 # Virtual environments and local configuration
 .venv/
@@ -23,3 +24,6 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local data directory
+data/

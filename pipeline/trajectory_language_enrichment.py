@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from data_quality_audit import (
+from pipeline.data_quality_audit import (
     AuditConfig,
     DatasetMetadata,
     EpisodeRecord,

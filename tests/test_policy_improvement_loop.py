@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
-from data_quality_audit import audit_dataset
-from feedback_dataset_build import FeedbackBuildConfig, run_feedback_build
+from pipeline.data_quality_audit import audit_dataset
+from pipeline.feedback_dataset_build import FeedbackBuildConfig, run_feedback_build
 from policy_improvement.capture import (
     AsyncTriggerMonitor,
     BoundedCaptureBuffer,
@@ -29,7 +29,7 @@ from policy_improvement.contracts import (
 )
 from policy_improvement.intervention import InterventionController
 from policy_improvement.plugins import PromotionPolicy
-from policy_iteration import IterationConfig, run_policy_iteration
+from pipeline.policy_iteration import IterationConfig, run_policy_iteration
 from tests.test_dataset_etl_pipeline import write_rgb_dataset
 
 

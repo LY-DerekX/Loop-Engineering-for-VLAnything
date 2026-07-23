@@ -13,9 +13,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from dataset_clean_build import build_clean_dataset
-from data_quality_audit import audit_dataset
-from dataset_merge import merge_datasets
+from pipeline.dataset_clean_build import build_clean_dataset
+from pipeline.data_quality_audit import audit_dataset, audit_dataset_semantic_reuse
+from pipeline.dataset_merge import merge_datasets
 from utils.semantic_evaluator import load_evaluator
 from utils.task_semantic_profile import TaskProfileRegistry, TaskSemanticProfile
 
@@ -366,6 +366,114 @@ class LeRobotPipelineTests(unittest.TestCase):
             self.assertEqual(summary["semantic_evaluation"]["review"], 2)
             self.assertEqual(summary["semantic_evaluation"]["low_score_review"], 1)
             self.assertEqual(summary["semantic_evaluation"]["uncertain_score_review"], 1)
+
+    def test_semantic_reuse_merges_prior_structural_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_rgb_dataset(root, "reuse_dataset", [3, 2, 2], 10)
+            report_dir = root / "reuse_quality_report"
+
+            exit_code = audit_dataset(
+                root=dataset,
+                out_dir=report_dir,
+                depth_check="header",
+                video_check="metadata",
+                video_content_check="none",
+                sample_frames=0,
+                depth_sample_frames=0,
+                duplicate_check="none",
+                video_sample_stride=30,
+            )
+            self.assertEqual(exit_code, 0)
+
+            report_path = report_dir / "quality_report.csv"
+            with report_path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                fields = reader.fieldnames
+                rows = list(reader)
+            rows[1]["review_reasons"] = (
+                f"video_file_black_high_review:{RGB_KEY};semantic_low_score_review"
+            )
+            rows[1]["status"] = "review"
+            with report_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            evaluator = load_evaluator(f"{__name__}:DeterministicSemanticEvaluator")
+            exit_code = audit_dataset_semantic_reuse(
+                root=dataset,
+                out_dir=report_dir,
+                semantic_evaluator=evaluator,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(evaluator.seen, [0, 1, 2])
+            with report_path.open(newline="", encoding="utf-8") as handle:
+                merged = list(csv.DictReader(handle))
+            self.assertEqual(merged[0]["status"], "review")
+            self.assertEqual(merged[0]["structural_status"], "keep")
+            self.assertEqual(merged[0]["semantic_status"], "review")
+            self.assertIn("semantic_low_score_review", merged[0]["review_reasons"])
+            self.assertIn(
+                "structural_checks_reused_from_prior_report", merged[0]["not_checked"]
+            )
+            self.assertEqual(merged[1]["structural_status"], "review")
+            self.assertIn("video_file_black_high_review", merged[1]["review_reasons"])
+            self.assertIn("semantic_uncertain_score_review", merged[1]["review_reasons"])
+            self.assertNotIn("semantic_low_score_review", merged[1]["review_reasons"])
+            self.assertEqual(merged[2]["status"], "keep")
+            self.assertEqual(merged[2]["semantic_status"], "pass")
+            summary = json.loads(
+                (report_dir / "quality_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["audit_mode"], "semantic_reuse")
+            self.assertEqual(summary["reused_report"], str(report_path))
+            self.assertTrue(summary["semantic_evaluation"]["enabled"])
+            self.assertEqual(summary["semantic_evaluation"]["pass"], 1)
+            self.assertEqual(summary["semantic_evaluation"]["review"], 2)
+
+    def test_semantic_reuse_rejects_report_from_other_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_a = write_rgb_dataset(root, "reuse_a_dataset", [3, 2, 2], 10)
+            dataset_b = write_rgb_dataset(root, "reuse_b_dataset", [3, 2, 2], 40)
+            report_a = root / "reuse_a_report"
+
+            exit_code = audit_dataset(
+                root=dataset_a,
+                out_dir=report_a,
+                depth_check="header",
+                video_check="metadata",
+                video_content_check="none",
+                sample_frames=0,
+                depth_sample_frames=0,
+                duplicate_check="none",
+                video_sample_stride=30,
+            )
+            self.assertEqual(exit_code, 0)
+
+            report_b = root / "reuse_b_report"
+            evaluator = load_evaluator(f"{__name__}:DeterministicSemanticEvaluator")
+            exit_code = audit_dataset_semantic_reuse(
+                root=dataset_b,
+                out_dir=report_b,
+                semantic_evaluator=evaluator,
+                reuse_report=report_a / "quality_report.csv",
+            )
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(evaluator.seen, [])
+            summary = json.loads(
+                (report_b / "quality_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["status"], "fail")
+            self.assertTrue(
+                any(
+                    error.startswith("prior_report_dataset_mismatch")
+                    for error in summary["global_errors"]
+                )
+            )
 
     def test_merge_audit_and_clean_small_rgbd_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

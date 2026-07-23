@@ -14,6 +14,7 @@ drop lists to build a cleaned dataset after review.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -959,12 +960,14 @@ def build_summary(
     audits: list[EpisodeQuality],
     global_errors: list[str],
     thresholds: dict[str, float | None],
+    fingerprint: str | None = None,
 ) -> dict[str, Any]:
     keep = [a.episode_index for a in audits if a.status == "keep"]
     review = [a.episode_index for a in audits if a.status == "review"]
     drop = [a.episode_index for a in audits if a.status == "drop"]
     return {
         "dataset": str(config.root),
+        "dataset_fingerprint": fingerprint,
         "status": "fail" if global_errors or drop else "pass_with_review" if review else "pass",
         "policy": "full_conservative_quality_audit",
         "global_errors": global_errors,
@@ -1063,7 +1066,15 @@ def run_audit(config: AuditConfig) -> int:
     thresholds = apply_distribution_reviews(state.audits, state)
     apply_duplicate_reviews(state, config.duplicate_check)
     refresh_structural_status(state.audits)
-    summary = build_summary(config, metadata, runtime, state.audits, global_errors, thresholds)
+    summary = build_summary(
+        config,
+        metadata,
+        runtime,
+        state.audits,
+        global_errors,
+        thresholds,
+        fingerprint=dataset_fingerprint(config.root),
+    )
     write_quality_outputs(config.out_dir, state.audits, summary)
     print_audit_summary(config, state.audits, summary)
     return 1 if global_errors or summary["drop"] else 0
@@ -1116,6 +1127,246 @@ def audit_dataset(
     return run_audit(config)
 
 
+SEMANTIC_REASON_PREFIX = "semantic_"
+
+
+def dataset_fingerprint(root: Path) -> str:
+    """Hash audit-relevant file identities without loading large media payloads.
+
+    Metadata files are content-hashed. Dataset payloads use relative path, size,
+    and modification time so a replaced parquet/video/depth file invalidates a
+    reused structural report at low cost.
+    """
+    root = root.resolve()
+    digest = hashlib.sha256()
+    metadata_files = [
+        root / "meta" / "info.json",
+        root / "meta" / "stats.json",
+        root / "meta" / "tasks.parquet",
+        root / "meta" / "episodes" / "chunk-000" / "file-000.parquet",
+    ]
+    for path in metadata_files:
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        if path.is_file():
+            digest.update(path.read_bytes())
+        else:
+            digest.update(b"<missing>")
+    for directory_name in ("data", "videos", "depth_sidecar"):
+        directory = root / directory_name
+        if not directory.exists():
+            continue
+        for path in sorted(
+            (item for item in directory.rglob("*") if item.is_file()),
+            key=lambda item: item.relative_to(root).as_posix(),
+        ):
+            stat = path.stat()
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(str(stat.st_size).encode("ascii"))
+            digest.update(str(stat.st_mtime_ns).encode("ascii"))
+    return digest.hexdigest()
+
+
+def load_prior_audits(report_path: Path) -> dict[int, EpisodeQuality]:
+    """Rebuild structural findings from a prior quality report.
+
+    Semantic reasons and metrics are stripped so a semantic-only rerun replaces
+    the prior semantic verdicts instead of accumulating them.
+    """
+    audits: dict[int, EpisodeQuality] = {}
+    with report_path.open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            episode_text = (row.get("episode_index") or "").strip()
+            if not episode_text:
+                continue
+            audit = EpisodeQuality(episode_index=int(episode_text))
+            audit.length = int(row.get("length") or 0)
+            audit.data_rows = int(row.get("data_rows") or 0)
+            audit.depth_files = int(row.get("depth_files") or 0)
+            audit.drop_reasons = [
+                reason for reason in (row.get("drop_reasons") or "").split(";") if reason
+            ]
+            audit.review_reasons = [
+                reason
+                for reason in (row.get("review_reasons") or "").split(";")
+                if reason and not reason.startswith(SEMANTIC_REASON_PREFIX)
+            ]
+            audit.not_checked = [
+                reason
+                for reason in (row.get("not_checked") or "").split(";")
+                if reason and not reason.startswith(SEMANTIC_REASON_PREFIX)
+            ]
+            try:
+                metrics = json.loads(row.get("metrics_json") or "{}")
+            except json.JSONDecodeError:
+                metrics = {}
+            if isinstance(metrics, dict):
+                audit.metrics = {
+                    key: value
+                    for key, value in metrics.items()
+                    if not key.startswith(SEMANTIC_REASON_PREFIX)
+                }
+            audit.status = (
+                "drop"
+                if audit.drop_reasons
+                else "review"
+                if audit.review_reasons
+                else "keep"
+            )
+            audit.structural_status = audit.status
+            audits[audit.episode_index] = audit
+    return audits
+
+
+def read_task_index_data(root: Path, record: EpisodeRecord) -> pa.Table | None:
+    data_path = (
+        root / "data" / f"chunk-{record.data_chunk:03d}" / f"file-{record.data_file:03d}.parquet"
+    )
+    try:
+        return pq.read_table(data_path, columns=["task_index"])
+    except Exception:
+        return None
+
+
+def run_semantic_reuse(config: AuditConfig, report_path: Path) -> int:
+    """Reuse a fingerprint-matched structural report and rerun only semantics."""
+    if config.semantic_evaluator is None:
+        raise ValueError("semantic reuse mode requires a configured semantic evaluator")
+    missing = [
+        f"missing_required_path:{path}"
+        for path in required_dataset_paths(config.root)
+        if not path.exists()
+    ]
+    if missing:
+        return write_failure(config.out_dir, config.root, missing)
+    if not report_path.exists():
+        return write_failure(config.out_dir, config.root, [f"missing_prior_report:{report_path}"])
+    try:
+        metadata = load_metadata(config)
+    except Exception as exc:
+        return write_failure(
+            config.out_dir, config.root, [f"cannot_read_metadata:{type(exc).__name__}:{exc}"]
+        )
+    global_errors = validate_global_metadata(config.root, metadata)
+    current_fingerprint = dataset_fingerprint(config.root)
+    prior_thresholds: dict[str, Any] = {}
+    prior_summary_path = report_path.parent / "quality_summary.json"
+    if not prior_summary_path.exists():
+        return write_failure(
+            config.out_dir, config.root, [f"prior_report_summary_missing:{prior_summary_path}"]
+        )
+    try:
+        prior_summary = json.loads(prior_summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return write_failure(
+            config.out_dir, config.root, [f"cannot_read_prior_summary:{type(exc).__name__}:{exc}"]
+        )
+    prior_dataset = prior_summary.get("dataset")
+    if prior_dataset and Path(str(prior_dataset)).resolve() != config.root.resolve():
+        return write_failure(
+            config.out_dir, config.root, [f"prior_report_dataset_mismatch:{prior_dataset}"]
+        )
+    prior_fingerprint = str(prior_summary.get("dataset_fingerprint") or "")
+    if not prior_fingerprint:
+        return write_failure(config.out_dir, config.root, ["prior_report_fingerprint_missing"])
+    if prior_fingerprint != current_fingerprint:
+        return write_failure(
+            config.out_dir,
+            config.root,
+            [f"prior_report_fingerprint_mismatch:{prior_fingerprint}!={current_fingerprint}"],
+        )
+    if isinstance(prior_summary.get("thresholds"), dict):
+        prior_thresholds = prior_summary["thresholds"]
+    try:
+        prior_audits = load_prior_audits(report_path)
+    except Exception as exc:
+        return write_failure(
+            config.out_dir, config.root, [f"cannot_read_prior_report:{type(exc).__name__}:{exc}"]
+        )
+    expected_episodes = {int(value) for value in metadata.episode_cols["episode_index"]}
+    if set(prior_audits) != expected_episodes:
+        missing_episodes = sorted(expected_episodes.difference(prior_audits))
+        extra_episodes = sorted(set(prior_audits).difference(expected_episodes))
+        return write_failure(
+            config.out_dir,
+            config.root,
+            [
+                "prior_report_episode_mismatch:"
+                f"missing={missing_episodes[:20]}:extra={extra_episodes[:20]}"
+            ],
+        )
+    state = AuditState()
+    for row in range(metadata.episodes.num_rows):
+        record = EpisodeRecord.from_columns(row, metadata.episode_cols)
+        audit = prior_audits[record.episode_index]
+        if audit.length != record.length:
+            return write_failure(
+                config.out_dir,
+                config.root,
+                [
+                    "prior_report_length_mismatch:"
+                    f"episode={record.episode_index}:{audit.length}!={record.length}"
+                ],
+            )
+        state.register(audit)
+        audit.skip("structural_checks_reused_from_prior_report")
+        data = read_task_index_data(config.root, record)
+        apply_semantic_evaluation(config, metadata, record, data, audit)
+    refresh_structural_status(state.audits)
+    runtime = AuditRuntime(
+        video_check="reused_prior_report",
+        video_content_check="reused_prior_report",
+        ffprobe_path=None,
+        ffmpeg_path=None,
+    )
+    summary = build_summary(
+        config,
+        metadata,
+        runtime,
+        state.audits,
+        global_errors,
+        {},
+        fingerprint=current_fingerprint,
+    )
+    summary["audit_mode"] = "semantic_reuse"
+    summary["reused_report"] = str(report_path)
+    summary["depth_check"] = "reused_prior_report"
+    if prior_thresholds:
+        summary["thresholds"] = prior_thresholds
+    write_quality_outputs(config.out_dir, state.audits, summary)
+    print_audit_summary(config, state.audits, summary)
+    return 1 if global_errors or summary["drop"] else 0
+
+
+def audit_dataset_semantic_reuse(
+    root: Path,
+    out_dir: Path,
+    semantic_evaluator: SemanticEvaluator,
+    reuse_report: Path | None = None,
+    semantic_review_threshold: float = 0.5,
+    semantic_pass_threshold: float = 0.9,
+    task_profiles: TaskProfileRegistry | None = None,
+) -> int:
+    """Rerun only semantic evaluation against an existing structural report."""
+    config = AuditConfig(
+        root=root.resolve(),
+        out_dir=out_dir,
+        depth_check="none",
+        video_check="metadata",
+        video_content_check="none",
+        sample_frames=0,
+        depth_sample_frames=0,
+        duplicate_check="none",
+        video_sample_stride=1,
+        semantic_evaluator=semantic_evaluator,
+        semantic_review_threshold=semantic_review_threshold,
+        semantic_pass_threshold=semantic_pass_threshold,
+        task_profiles=task_profiles,
+    )
+    report_path = reuse_report or (out_dir / "quality_report.csv")
+    return run_semantic_reuse(config, report_path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run full conservative quality audit on a LeRobot dataset.")
     parser.add_argument("dataset", type=Path)
@@ -1165,6 +1416,23 @@ def main() -> None:
         default=None,
         help="optional feedback sidecar directory to validate against dataset frames",
     )
+    parser.add_argument(
+        "--semantic-only",
+        action="store_true",
+        help=(
+            "reuse the structural results of a prior fingerprint-matched report and "
+            "rerun only the semantic evaluation; requires --semantic-evaluator"
+        ),
+    )
+    parser.add_argument(
+        "--reuse-report",
+        type=Path,
+        default=None,
+        help=(
+            "prior quality_report.csv to reuse with --semantic-only; "
+            "defaults to <out-dir>/quality_report.csv"
+        ),
+    )
     args = parser.parse_args()
 
     out_dir = args.out_dir or default_audit_output_dir(args.dataset)
@@ -1178,6 +1446,20 @@ def main() -> None:
         if args.task_profile_dir is not None
         else None
     )
+    if args.semantic_only:
+        if semantic_evaluator is None:
+            parser.error("--semantic-only requires --semantic-evaluator")
+        raise SystemExit(
+            audit_dataset_semantic_reuse(
+                root=args.dataset,
+                out_dir=out_dir,
+                semantic_evaluator=semantic_evaluator,
+                reuse_report=args.reuse_report,
+                semantic_review_threshold=args.semantic_review_threshold,
+                semantic_pass_threshold=args.semantic_pass_threshold,
+                task_profiles=task_profiles,
+            )
+        )
     raise SystemExit(
         audit_dataset(
             root=args.dataset,

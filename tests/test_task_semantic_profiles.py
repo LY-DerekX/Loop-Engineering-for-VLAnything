@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from task_semantic_studio import build_audit_command
+from tools.task_semantic_studio import build_audit_command
 from utils.task_description_parser import HeuristicTaskDescriptionParser
 from utils.task_semantic_profile import TaskProfileRegistry, TaskSemanticProfile
 

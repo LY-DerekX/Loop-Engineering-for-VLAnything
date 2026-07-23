@@ -29,4 +29,9 @@ Planned contents:
 - visuo-tactile recording entrypoint and example configs;
 - tactile sidecar storage helpers aligned with the existing `depth_sidecar/` convention.
 
+Camera configuration will reuse the shared inventory at
+`record/camera_profiles.yaml` (`--camera_profile=<name>`), the same mechanism
+already used by the RGB and RGB-D recording paths, so camera hardware facts
+stay defined in one place across all collection modalities.
+
 After recording, the dataset will go through the same toolkit steps as the RGB and RGB-D paths: merge, audit, clean, and upload.
