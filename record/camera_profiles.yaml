@@ -5,8 +5,8 @@
 # path, resolution, fps, and depth on/off. Select a profile at record time:
 #
 #   python .\rgb_record\rgb_record.py --config_path=... --camera_profile=rgb_head_wrist
-#   python .\examples\rgbd_vla_depth\record.py --config_path=... --camera_profile=realsense_d435_front_d405_wrist
-#   python .\examples\rgbd_vla_depth\feedback_record.py --config_path=... --camera_profile=orbbec_front_uvc_wrist
+#   python .\rgbd_record\record.py --config_path=... --camera_profile=realsense_d435_front_d405_wrist
+#   python .\rgbd_record\feedback_record.py --config_path=... --camera_profile=orbbec_front_uvc_wrist
 #
 # `--camera_profile=default` selects `default_profile` below. The selected
 # profile replaces `robot.cameras` in the record config; every other field in

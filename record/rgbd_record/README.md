@@ -1,178 +1,107 @@
-# LeRobot RGB-D Capture (Orbbec / Intel RealSense)
+# RGB-D recording (framework-free)
 
-This folder contains the LeRobot-side code needed to collect RGB-D data with an Orbbec Femto Bolt or an Intel RealSense D405 / D435 / D435i camera.
+RGB-D demonstration capture for SO-100 / SO-101 arms with Orbbec or Intel
+RealSense cameras. No lerobot dependency and no "copy into a lerobot checkout"
+step — run the entrypoints directly from this repository.
 
-It extends the data pipeline upstream of merge, audit, clean, and upload by adding a real robot data collection path.
+RGB streams are stored as mp4 video; every camera with `use_depth: true` produces
+an `<name>_depth` observation saved as a lossless **uint16 PNG sidecar** under
+`depth_sidecar/`.
 
-## Supported RGB-D Cameras
+## Supported cameras
 
-| Camera | Config `type` | Depth resolution | Notes |
+| Camera | config `type` | Depth | Notes |
 | --- | --- | --- | --- |
-| Orbbec Femto Bolt | `orbbec` | independent `depth_width/height/fps`, optional align-to-color | overlay backend (`src/lerobot/cameras/orbbec/`) |
-| Intel RealSense D435 / D435i | `intelrealsense` | same `width/height/fps` as the color stream | uses LeRobot's built-in RealSense backend; 848x480@30 is the depth sweet spot |
-| Intel RealSense D405 | `intelrealsense` | same `width/height/fps` as the color stream | near-range depth (~7cm-50cm), ideal wrist camera |
-| Plain UVC webcam | `opencv` | no depth | RGB only |
+| Orbbec Femto Bolt | `orbbec` | independent `depth_width/height/fps`, optional align-to-color | `pip install pyorbbecsdk2` |
+| RealSense D435 / D435i | `intelrealsense` | shares color `width/height/fps` | 848x480@30 is the depth sweet spot |
+| RealSense D405 | `intelrealsense` | shares color `width/height/fps` | near-range (~7cm-50cm), ideal wrist cam |
+| UVC webcam | `opencv` | none | RGB only |
 
-Any camera with `use_depth: true` produces an `<name>_depth` observation that is
-stored as a lossless uint16 PNG sidecar; the SO follower normalizes both the
-Orbbec `(H, W)` and RealSense `(H, W, 1)` depth buffers to the same dataset
-shape.
-
-Two ways to switch cameras:
-
-1. **Shared camera inventory (recommended)**: edit hardware facts once in
-   `<lerobot_root>/camera_profiles.yaml` (copied from `record/camera_profiles.yaml`)
-   and select at record time with `--camera_profile=<name>`. The same inventory
-   serves the RGB, RGB-D, and future visuo-tactile recording paths.
-2. **Inline YAML blocks**: keep cameras inside the record config — see the
-   commented variants in `examples/rgbd_vla_depth/configs/record_rgbd.yaml` and
-   the ready-to-run all-RealSense config
-   `examples/rgbd_vla_depth/configs/record_rgbd_realsense.yaml`.
-
-## Scope
-
-This folder is only for data collection. It adds RGB-D capture support (Orbbec backend plus RealSense-compatible wiring), recording scripts, and lossless depth sidecar storage helpers.
-
-It does not contain this project's depth model training code, depth model inference code, evaluation config, or pretrained model weights. The recorder follows LeRobot's normal recording interfaces, but the included project-local Python package only provides RGB-D data helpers.
-
-## Where To Put It In LeRobot
-
-Copy the contents of this folder into the root of a `huggingface/lerobot` checkout. The target is the directory that contains LeRobot's own `pyproject.toml` and `src/lerobot/`.
-
-Do not copy this folder as:
-
-```text
-<lerobot_root>/rgbd_record/
-```
-
-Merge these contents into the LeRobot repo root instead:
+## Install
 
 ```powershell
-$LEROBOT_ROOT="<path-to-lerobot>"
-Copy-Item -Recurse -Force .\record\rgbd_record\examples $LEROBOT_ROOT\
-Copy-Item -Recurse -Force .\record\rgbd_record\src $LEROBOT_ROOT\
-Copy-Item -Force .\record\rgbd_record\pyproject.toml $LEROBOT_ROOT\
-Copy-Item -Force .\record\camera_profiles.yaml $LEROBOT_ROOT\
-Copy-Item -Force .\record\camera_profiles.py $LEROBOT_ROOT\
-Copy-Item -Recurse -Force .\policy_improvement $LEROBOT_ROOT\
+python -m pip install -r record/requirements.txt
+pip install pyorbbecsdk2      # and/or: pip install pyrealsense2
 ```
 
-After copying, the expected layout is:
-
-```text
-<lerobot_root>/examples/rgbd_vla_depth/
-<lerobot_root>/policy_improvement/
-<lerobot_root>/src/lerobot/cameras/orbbec/
-<lerobot_root>/src/lerobot/scripts/
-<lerobot_root>/src/lerobot/robots/so_follower/
-<lerobot_root>/pyproject.toml
-```
-
-Install from the LeRobot repo root:
+Find cameras and set serials/ports in the configs:
 
 ```powershell
-cd $LEROBOT_ROOT
-python -m pip install -e ".[feetech,orbbec,intelrealsense,rgbd_vla]" -e .\examples\rgbd_vla_depth
+python ./record/rgbd_record/find_cameras.py orbbec
+python ./record/rgbd_record/find_cameras.py realsense
 ```
 
-Drop `orbbec` or `intelrealsense` from the extras list if that camera family is
-not used:
+## Record
 
 ```powershell
-python -m pip install -e ".[feetech,intelrealsense,rgbd_vla]" -e .\examples\rgbd_vla_depth
+python ./record/rgbd_record/record.py --config_path=./record/rgbd_record/configs/record_rgbd.yaml
 ```
 
-## What It Provides
+All-RealSense rig (D435 front + D405 wrist):
 
-- `src/lerobot/cameras/orbbec/`: Orbbec RGB-D camera backend.
-- `src/lerobot/scripts/`: patched LeRobot commands for finding cameras, recording, calibration, and teleoperation.
-- `src/lerobot/robots/so_follower/`: SO follower support for RGB-D observations.
-- `examples/rgbd_vla_depth/record.py`: RGB-D recording entrypoint.
-- `examples/rgbd_vla_depth/feedback_record.py`: human-guided policy feedback entrypoint.
-- `examples/rgbd_vla_depth/configs/record_rgbd.yaml`: camera-switchable recording config (Orbbec active, RealSense D435/D405 variants included as commented blocks).
-- `examples/rgbd_vla_depth/configs/record_rgbd_realsense.yaml`: ready-to-run all-RealSense config (D435 front + D405 wrist).
-- `examples/rgbd_vla_depth/configs/record_rgbd_feedback.yaml`: recovery/correction, event-buffer, and continuous capture config.
-- `examples/rgbd_vla_depth/src/lerobot_policy_rgbd_vla_depth/data/`: helpers for depth feature naming and uint16 PNG sidecar storage.
+```powershell
+python ./record/rgbd_record/record.py --config_path=./record/rgbd_record/configs/record_rgbd_realsense.yaml
+```
 
-## Dataset Output
+Pick cameras from the shared inventory instead of editing the config:
 
-The recorder keeps RGB streams in standard LeRobot video storage and saves depth frames as lossless uint16 PNG files:
+```powershell
+python ./record/rgbd_record/record.py `
+  --config_path=./record/rgbd_record/configs/record_rgbd.yaml `
+  --camera_profile=realsense_d435_front_d405_wrist
+```
+
+Add `--mock` for an offline dry-run. Recording keys: **Right** = end episode,
+**Left** = re-record, **Esc** = stop.
+
+## Feedback (human-guided policy improvement)
+
+```powershell
+python ./record/rgbd_record/feedback_record.py `
+  --config_path=./record/rgbd_record/configs/record_rgbd_feedback.yaml `
+  --policy.path=./outputs/train/run/checkpoints/last/pretrained_model
+```
+
+The safe default is `feedback.mode: corrections_only`. Press `i` to take over and
+begin **Recovery**, `c` to mark **Correction**, and `i` again to complete and hand
+control back to the policy. Feedback provenance (control phase, intervention
+ranges, the policy's proposed action) is written to a sidecar **outside** the
+dataset (`feedback_outputs/...`), so autonomous failure actions never become
+expert targets.
+
+### Policy inference is pluggable
+
+Teleoperated capture, intervention labelling, and the sidecar are 100%
+framework-free. Only the in-loop policy inference needs a policy runtime, behind
+`recorder.policy_runner.PolicyRunner`:
+
+- **default**: `LeRobotPolicyRunner` lazily imports `lerobot` to run any lerobot
+  checkpoint (`pip install lerobot`). Nothing else in the recorder imports lerobot.
+- **custom**: implement `PolicyRunner` (`reset()` + `select_action(obs, task)`) to
+  drive any other policy stack with zero lerobot dependency.
+- **offline**: `--mock` uses a `StubPolicyRunner` (hold-position), useful for dry runs.
+
+> Safe autonomous → human handover needs an actuated leader with position
+> feedback. A passive SO leader requires
+> `feedback.require_feedback_alignment: false` (accepting a manual-alignment
+> warning) or a hardware-specific handover adapter.
+
+Three capture modes (in `configs/record_rgbd_feedback.yaml`): `corrections_only`
+(human frames only), `event_buffer` (retain a pre-trigger window), `continuous`
+(retain autonomous frames as analysis-only data).
+
+## Output
 
 ```text
-data/
-videos/
+data/           meta/           videos/
 depth_sidecar/observation.images.front_depth/episode-000000/frame-000000.png
 meta/rgbd_vla_depth_recording.json
 ```
 
-## Typical Entry Points
-
-Find the cameras:
+A standard LeRobot v3.0 dataset. Visualize recorded depth:
 
 ```powershell
-lerobot-find-cameras orbbec
-lerobot-find-cameras realsense
+python ./tools/depth_visualize.py <dataset_root>/depth_sidecar --stats
 ```
 
-Record RGB-D data (edit the camera blocks in the YAML to switch cameras):
-
-```powershell
-python .\examples\rgbd_vla_depth\record.py --config_path=.\examples\rgbd_vla_depth\configs\record_rgbd.yaml
-```
-
-Record with the all-RealSense rig (D435 front + D405 wrist):
-
-```powershell
-python .\examples\rgbd_vla_depth\record.py --config_path=.\examples\rgbd_vla_depth\configs\record_rgbd_realsense.yaml
-```
-
-Or select any camera set from the shared inventory without editing the record
-config (works for `feedback_record.py` too):
-
-```powershell
-python .\examples\rgbd_vla_depth\record.py `
-  --config_path=.\examples\rgbd_vla_depth\configs\record_rgbd.yaml `
-  --camera_profile=realsense_d435_front_d405_wrist
-```
-
-Collect policy feedback with explicit Recovery/Correction labels:
-
-```powershell
-python .\examples\rgbd_vla_depth\feedback_record.py `
-  --config_path=.\examples\rgbd_vla_depth\configs\record_rgbd_feedback.yaml `
-  --policy.path=.\outputs\train\run\checkpoints\last\pretrained_model
-```
-
-The safe default is `feedback.mode: corrections_only`. Press `i` to align the
-actuated teleoperator and begin Recovery, `c` to mark Correction, and `i` again
-to save the intervention and hand control back to the policy. The associated
-feedback sidecar stays outside the recorded dataset.
-
-Visualize recorded depth after collection from this repository root:
-
-```powershell
-python .\tools\depth_visualize.py <dataset_root>\depth_sidecar --stats
-```
-
-The main config to edit before recording is:
-
-```text
-examples/rgbd_vla_depth/configs/record_rgbd.yaml
-```
-
-Important fields in `record_rgbd.yaml`:
-
-```yaml
-robot:
-  cameras:
-    front:
-      type: orbbec
-      serial_number_or_name: "YOUR_FEMTO_BOLT_SERIAL"
-      use_depth: true
-      align_depth_to_color: true
-dataset:
-  repo_id: YOUR_HF_USERNAME/so100_rgbd_dataset
-  fps: 30
-  num_episodes: 10
-  episode_time_s: 60
-```
+Then run the toolkit's merge / audit / clean / upload steps.
