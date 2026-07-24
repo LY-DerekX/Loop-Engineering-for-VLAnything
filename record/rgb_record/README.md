@@ -1,140 +1,70 @@
-# LeRobot RGB Capture
+# RGB recording (framework-free)
 
-This folder is a copy-in RGB-only recording overlay for the official Hugging Face LeRobot repository.
+RGB-only demonstration capture for SO-100 / SO-101 arms. No lerobot dependency and
+no "copy into a lerobot checkout" step — run the entrypoints directly from this
+repository. Depth-enabled cameras/profiles are rejected here; use
+[../rgbd_record/](../rgbd_record/) for depth.
 
-Copy this whole folder into a LeRobot checkout, then run the local wrappers in this folder. The wrappers call LeRobot's own `lerobot.scripts.lerobot_record` and `lerobot.scripts.lerobot_teleoperate`; they do not fork or patch LeRobot source code.
+Default cameras are two RGB webcams: `head` (fixed) and `wrist` (wrist-mounted).
 
-The default configs record two RGB cameras:
-
-- `head`: fixed head/global camera.
-- `wrist`: wrist-mounted camera.
-
-Official LeRobot project:
-
-```text
-https://github.com/huggingface/lerobot
-```
-
-Official recording and camera documentation:
-
-```text
-https://huggingface.co/docs/lerobot/il_robots
-https://huggingface.co/docs/lerobot/cameras
-```
-
-## Scope
-
-Use this path when the dataset contains:
-
-- RGB camera videos through stock LeRobot camera backends such as OpenCV;
-- robot state and action trajectories;
-- language task metadata;
-- no depth stream and no `depth_sidecar/` directory.
-
-## Copy Into LeRobot
-
-From this toolkit repository:
+## Install
 
 ```powershell
-$LEROBOT_ROOT="E:\path\to\lerobot"
-Copy-Item -Recurse -Force .\record\rgb_record $LEROBOT_ROOT\
-Copy-Item -Force .\record\camera_profiles.yaml $LEROBOT_ROOT\
-Copy-Item -Force .\record\camera_profiles.py $LEROBOT_ROOT\
+python -m pip install -r record/requirements.txt
 ```
 
-`camera_profiles.yaml` is the shared camera inventory used by every recording
-path (RGB, RGB-D, visuo-tactile). It is optional here: without
-`--camera_profile`, the inline `cameras:` block in the record config is used
-unchanged.
-
-Then work from the LeRobot root:
+`ffmpeg`/`ffprobe` must be available (PATH or conda `Library/bin`). Find OpenCV
+camera indices, then set them in the configs:
 
 ```powershell
-cd $LEROBOT_ROOT
-python -m pip install --upgrade pip
-python -m pip install -e ".[feetech,core_scripts]"
+python ./record/rgbd_record/find_cameras.py opencv
 ```
 
-Choose the LeRobot extras that match your hardware. For SO-100 and SO-101, `feetech` is normally required. On older LeRobot versions that do not define `core_scripts`, use `python -m pip install -e ".[feetech]"`.
-
-## Find Cameras
-
-List OpenCV cameras:
-
-```powershell
-lerobot-find-cameras opencv
-```
-
-Record the camera indices, resolution, and FPS that you want to use. On Windows, `index_or_path: 0` is usually the first USB camera, but indices can change after unplugging or rebooting.
-
-Update these fields in:
+Edit camera index/resolution/fps and robot/leader serial ports in:
 
 ```text
 rgb_record/configs/head_wrist_rgb_record.yaml
 rgb_record/configs/head_wrist_rgb_teleoperate.yaml
 ```
 
-## Teleoperate With Head And Wrist Preview
+## Calibrate
+
+Uses lerobot's calibration location, so existing calibrations load unchanged. To
+calibrate a new arm:
 
 ```powershell
-python .\rgb_record\rgb_teleoperate.py `
-  --config_path=.\rgb_record\configs\head_wrist_rgb_teleoperate.yaml
+python ./record/rgb_record/rgb_teleoperate.py `
+  --config_path=./record/rgb_record/configs/head_wrist_rgb_teleoperate.yaml --calibrate
 ```
 
-Use the same robot and teleoperator IDs for teleoperation, recording, and replay so LeRobot can reuse the correct calibration files.
-
-## Record Head And Wrist RGB Dataset
+## Teleoperate
 
 ```powershell
-python .\rgb_record\rgb_record.py `
-  --config_path=.\rgb_record\configs\head_wrist_rgb_record.yaml
+python ./record/rgb_record/rgb_teleoperate.py `
+  --config_path=./record/rgb_record/configs/head_wrist_rgb_teleoperate.yaml
 ```
 
-The same config can still be overridden from the command line:
+## Record
 
 ```powershell
-python .\rgb_record\rgb_record.py `
-  --config_path=.\rgb_record\configs\head_wrist_rgb_record.yaml `
-  --dataset.num_episodes=5 `
-  --dataset.single_task="Pick up the cup"
+python ./record/rgb_record/rgb_record.py `
+  --config_path=./record/rgb_record/configs/head_wrist_rgb_record.yaml
 ```
 
-Select the cameras from the shared inventory instead of the inline block:
+Override any field inline, e.g. `--dataset.num_episodes=5
+--dataset.single_task="Pick up the cup"`. Select cameras from the shared inventory
+with `--camera_profile=rgb_head_wrist` (see [../camera_profiles.yaml](../camera_profiles.yaml)).
+Add `--mock` for an offline dry-run.
 
-```powershell
-python .\rgb_record\rgb_record.py `
-  --config_path=.\rgb_record\configs\head_wrist_rgb_record.yaml `
-  --camera_profile=rgb_head_wrist
-```
+Recording keys: **Right** = end episode, **Left** = re-record, **Esc** = stop.
 
-The selected profile replaces `robot.cameras`; every other record field stays
-as configured. Profiles that enable `use_depth` are rejected on this RGB-only
-path with a pointer to `rgbd_record/`.
+## Output
 
-Replace `COM5`, `COM6`, camera indices, resolution, FPS, repository ID, episode count, and task text with the values for the real setup.
+A standard LeRobot v3.0 RGB dataset (`data/`, `meta/`, `videos/`) with no
+`depth_sidecar/`. Run the toolkit's merge / audit / clean / upload steps next.
 
-## Dataset Output
+## Operational notes
 
-The RGB-only dataset is a standard LeRobot dataset:
-
-```text
-data/
-meta/
-videos/
-```
-
-It should not contain:
-
-```text
-depth_sidecar/
-meta/rgbd_vla_depth_recording.json
-```
-
-After recording, run this toolkit's merge, audit, clean, and upload steps on the dataset root.
-
-## Operational Notes
-
-- Keep camera names stable across datasets. The default names are `head` and `wrist`.
-- Keep FPS, resolution, action space, and robot IDs stable when collecting data that will be merged.
-- Use `--resume=true` only when continuing the same interrupted recording session.
-- Set `--dataset.push_to_hub=False` when you want to audit and clean locally before uploading.
+- Keep camera names (`head`, `wrist`), fps, resolution, action space, and robot IDs
+  stable across datasets you intend to merge.
+- Set `dataset.push_to_hub: false` to audit and clean locally before uploading.
