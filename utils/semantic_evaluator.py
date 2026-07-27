@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class VideoSegment:
@@ -28,6 +30,29 @@ class VideoSegment:
 
 
 @dataclass(frozen=True)
+class EpisodeMotion:
+    """Action and state streams already loaded by the audit.
+
+    Both arrays are frame-major with shape (length, dim). They are exposed so
+    evaluators and deterministic consistency checks can compare what the
+    instruction says against what the arm actually did, without re-reading
+    parquet. Either array may be None when the column is absent or unreadable.
+    """
+
+    action: np.ndarray | None = None
+    state: np.ndarray | None = None
+    fps: float | None = None
+    gripper_index: int | None = None
+
+    def gripper_series(self) -> np.ndarray | None:
+        if self.action is None or self.gripper_index is None:
+            return None
+        if not 0 <= self.gripper_index < self.action.shape[1]:
+            return None
+        return self.action[:, self.gripper_index]
+
+
+@dataclass(frozen=True)
 class SemanticEpisode:
     """Inputs exposed to a semantic evaluator."""
 
@@ -37,6 +62,7 @@ class SemanticEpisode:
     tasks: tuple[str, ...]
     videos: tuple[VideoSegment, ...]
     task_profile: Mapping[str, Any] | None = None
+    motion: EpisodeMotion | None = None
 
 
 @dataclass(frozen=True)

@@ -374,6 +374,10 @@ The evaluator configuration file is optional and must contain one JSON object.
 Classes receive the object as keyword arguments; factories receive it as one
 dictionary.
 
+An evaluator also receives the episode's action and state arrays through
+`episode.motion`, so a backend can compare what the instruction says against
+what the arm actually did without re-reading parquet.
+
 Semantic output is added directly to quality_report.csv:
 
 - semantic_progress_curve_json
@@ -383,6 +387,9 @@ Semantic output is added directly to quality_report.csv:
 - semantic_failure_stage
 - semantic_status and semantic_evaluator
 - semantic_task_profile, semantic_review_threshold, and semantic_pass_threshold
+- semantic_progress_max_drop and semantic_progress_idle_tail_ratio
+- semantic_stage_timeline_source
+- semantic_motion_verbs and semantic_motion_gripper_transitions
 
 Success probability is used as the review score when provided; otherwise the
 last progress value is used. The default decision bands are:
@@ -399,6 +406,73 @@ on automatic pass, measure false-positive rates on human-labeled episodes and
 continue sampling high-scoring episodes for manual review. Evaluator errors
 also go to review so model failures cannot silently approve data. Episodes
 already marked drop by deterministic checks skip semantic inference.
+
+## Model-Free Semantic Consistency Checks
+
+A second group of semantic checks needs no evaluator and no model weights. They
+read the progress curve, the ordered stages of a Task Profile, and the
+action/state streams the audit has already loaded. Every finding is review-only,
+and every check reports itself as not-checked when its preconditions are absent
+rather than passing silently.
+
+Progress-curve shape (requires an evaluator, since it reads the curve):
+
+- `semantic_progress_regression_review`: the curve drops by 0.15 or more at some
+  point, which is what a dropped object or a retry looks like. This fires even
+  when the final score passes, so recoveries stay visible.
+- `semantic_progress_idle_tail_review`: the curve reaches 0.95 with 30% or more
+  of the episode still to run, so the tail is post-completion idling and the
+  episode is a trimming candidate.
+- `semantic_progress_idle_head_review`: progress does not start until halfway
+  through the episode.
+
+Stage ordering (requires an evaluator and `--task-profile-dir`):
+
+- `semantic_stage_order_violation_review`: the stage sequence goes backwards. An
+  evaluator can supply an explicit `details["stage_timeline"]`; otherwise the
+  timeline is derived from the progress curve against the cumulative stage
+  weights, and a backwards step only counts when the accompanying drop is larger
+  than curve noise.
+- `semantic_stage_skipped_review`: an intermediate stage is never visited.
+- `semantic_stage_unknown_review`: an explicit timeline names a stage that is
+  absent from the Task Profile.
+- `semantic_stage_dwell_outlier_review`: one stage lasted far longer or shorter
+  than the median for that task and stage across the dataset. A deviation must
+  clear both a robust MAD band and an absolute floor, so a tight distribution
+  does not turn ordinary jitter into findings.
+
+Action/language consistency (needs no evaluator at all):
+
+- `semantic_motion_gripper_pattern_review`: the verb in the task text and the
+  observed gripper actuation disagree. A pick task with no gripper transition, or
+  a push task with a full grasp cycle, is flagged.
+- `semantic_motion_vertical_direction_review`: a directional verb such as lift or
+  press moved the declared vertical axis the wrong way.
+
+~~~powershell
+python ./pipeline/data_quality_audit.py ./lerobot_derek_depth `
+  --motion-check signature `
+  --motion-vertical-index 2
+~~~
+
+The gripper channel is auto-detected as the action dimension that spends nearly
+all of its time at one of two levels; use `--motion-gripper-index` to declare it
+instead. Transitions are counted between the two levels the channel actually
+visits, so no assumption is made about whether a high value means open or closed.
+An episode whose gripper barely moves relative to the dataset median is treated
+as unactuated rather than as a sequence of noise-driven grasps.
+
+Verbs are matched from a built-in English/Chinese lexicon. Unmatched verbs,
+conflicting verbs (`pick up the sponge and wipe the table`), an unresolvable
+gripper channel, and an unconfigured vertical axis all record a
+`semantic_motion_*` entry in `not_checked` instead of a finding. Use
+`--motion-check none` to turn the group off.
+
+All of these reasons use the `semantic_` prefix, so `--semantic-only` replaces
+them on a rerun instead of accumulating them, and they never change
+`structural_status`. Counts per check are written to the `semantic_consistency`
+block of `quality_summary.json` so each check's precision can be measured on its
+own before its thresholds are tuned.
 
 ### Staged Audits: Reuse the Structural Report
 
@@ -528,6 +602,7 @@ language_enrichment_outputs/<dataset_name>/
   subtasks.jsonl
   events.jsonl
   state_descriptions.jsonl
+  subtask_boundary_alignment.jsonl
   annotations/
     episode-000000.json
 ~~~
@@ -539,6 +614,17 @@ when a Task Profile is configured, named subtask stages must belong to that
 Profile. The framework deliberately does not fabricate annotations without an
 annotator plugin. Automatically generated language remains model output and
 should be sampled for human verification before training.
+
+Generated subtask boundaries are additionally checked against the arm itself.
+Change points are taken from gripper level changes and from local minima of the
+non-gripper action speed that fall in the slowest quartile of the episode; a
+boundary counts as aligned when it sits within `--boundary-tolerance-frames` of
+one. Boundaries invented by a language model tend to land in the middle of a
+smooth motion, so an episode where fewer than half of the boundaries align is
+recorded as `language_subtask_boundary_unaligned_review` in
+`subtask_boundary_alignment.jsonl`, with counts in the manifest. Use
+`--boundary-check none` to skip it, and `--motion-gripper-index` to declare the
+gripper channel rather than relying on detection.
 
 ## Closed-Loop Policy Improvement
 

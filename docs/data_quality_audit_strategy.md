@@ -315,8 +315,16 @@ The automated pipeline should run in this order.
 7. Sensor quality sampling
 8. Duplicate detection
 9. Review-only semantic checks
-10. Report generation
+10. Review-only model-free consistency checks
+11. Report generation
 ```
+
+Step 10 needs no model. It reads the progress curve shape (regressions, idle
+head and tail), the stage timeline against Task Profile stage weights (ordering
+violations, skipped stages, dwell-time outliers), and the action stream against
+the verb in the task text (gripper actuation pattern, vertical direction). Each
+check reports itself as not-checked when its preconditions are missing, so a
+dataset that does not fit a check is never silently passed.
 
 The pipeline should stop early only for dataset-level fatal errors. Episode-level errors should be collected into the report so all problems are visible in one run.
 

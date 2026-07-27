@@ -34,6 +34,11 @@ class EpisodeQuality:
     semantic_success_probability: float | None = None
     semantic_score: float | None = None
     semantic_failure_stage: str = ""
+    semantic_progress_max_drop: float | None = None
+    semantic_progress_idle_tail_ratio: float | None = None
+    semantic_stage_timeline_source: str = ""
+    semantic_motion_verbs: str = ""
+    semantic_motion_gripper_transitions: int | None = None
     status: str = "keep"
     drop_reasons: list[str] = field(default_factory=list)
     review_reasons: list[str] = field(default_factory=list)
@@ -173,6 +178,11 @@ def write_quality_outputs(out_dir: Path, audits: list[EpisodeQuality], summary: 
         "semantic_success_probability",
         "semantic_score",
         "semantic_failure_stage",
+        "semantic_progress_max_drop",
+        "semantic_progress_idle_tail_ratio",
+        "semantic_stage_timeline_source",
+        "semantic_motion_verbs",
+        "semantic_motion_gripper_transitions",
         "length",
         "data_rows",
         "depth_files",
@@ -208,6 +218,21 @@ def write_quality_outputs(out_dir: Path, audits: list[EpisodeQuality], summary: 
                     ),
                     "semantic_score": "" if audit.semantic_score is None else audit.semantic_score,
                     "semantic_failure_stage": audit.semantic_failure_stage,
+                    "semantic_progress_max_drop": (
+                        "" if audit.semantic_progress_max_drop is None else audit.semantic_progress_max_drop
+                    ),
+                    "semantic_progress_idle_tail_ratio": (
+                        ""
+                        if audit.semantic_progress_idle_tail_ratio is None
+                        else audit.semantic_progress_idle_tail_ratio
+                    ),
+                    "semantic_stage_timeline_source": audit.semantic_stage_timeline_source,
+                    "semantic_motion_verbs": audit.semantic_motion_verbs,
+                    "semantic_motion_gripper_transitions": (
+                        ""
+                        if audit.semantic_motion_gripper_transitions is None
+                        else audit.semantic_motion_gripper_transitions
+                    ),
                     "episode_index": audit.episode_index,
                     "status": audit.status,
                     "length": audit.length,
