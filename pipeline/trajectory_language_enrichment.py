@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +14,20 @@ from pipeline.data_quality_audit import (
     AuditConfig,
     DatasetMetadata,
     EpisodeRecord,
+    episode_motion,
     load_metadata,
     read_episode_data,
     semantic_tasks_for_episode,
     semantic_videos_for_episode,
 )
 from utils.dataset_io import prepare_output_dir
+from utils.semantic_consistency import (
+    boundary_alignment_findings,
+    channel_traces,
+    kinematic_change_points,
+    select_gripper_index,
+    subtask_boundary_alignment,
+)
 from utils.language_annotation_profile import (
     LanguageAnnotationEpisode,
     TrajectoryLanguageAnnotation,
@@ -45,6 +53,15 @@ class LanguageEnrichmentConfig:
     task_profiles: TaskProfileRegistry | None = None
     approved_episodes: Path | None = None
     overwrite: bool = False
+    boundary_check: str = "kinematic"
+    motion_gripper_index: int | None = None
+    boundary_tolerance_frames: int = 5
+
+    def __post_init__(self) -> None:
+        if self.boundary_check not in {"none", "kinematic"}:
+            raise ValueError("boundary check must be one of: none, kinematic")
+        if self.boundary_tolerance_frames < 0:
+            raise ValueError("boundary tolerance must be non-negative")
 
 
 def default_enrichment_output_dir(dataset: Path) -> Path:
@@ -178,7 +195,62 @@ def _metadata_config(config: LanguageEnrichmentConfig) -> AuditConfig:
         depth_sample_frames=0,
         duplicate_check="none",
         video_sample_stride=30,
+        motion_check="none",
+        motion_gripper_index=config.motion_gripper_index,
     )
+
+
+def subtask_boundaries(annotation: TrajectoryLanguageAnnotation) -> tuple[int, ...]:
+    """Interior frames where the annotation claims one subtask hands off to the next."""
+    subtasks = annotation.subtasks
+    if len(subtasks) < 2:
+        return ()
+    frames: set[int] = set()
+    for previous, current in zip(subtasks, subtasks[1:]):
+        frames.add(current.start_frame)
+        frames.add(previous.end_frame + 1)
+    return tuple(sorted(frame for frame in frames if 0 < frame < annotation.length))
+
+
+def evaluate_boundary_alignment(
+    config: LanguageEnrichmentConfig,
+    episode: LanguageAnnotationEpisode,
+    annotation: TrajectoryLanguageAnnotation,
+) -> dict[str, Any]:
+    """Check annotated subtask boundaries against real changes in arm motion."""
+    row: dict[str, Any] = {
+        "episode_index": annotation.episode_index,
+        "status": "not_checked",
+        "reasons": [],
+    }
+    if config.boundary_check == "none":
+        row["status"] = "disabled"
+        return row
+    if episode.motion is None or episode.motion.action is None:
+        row["status"] = "action_unavailable"
+        return row
+    boundaries = subtask_boundaries(annotation)
+    if not boundaries:
+        row["status"] = "no_interior_boundary"
+        return row
+    motion = episode.motion
+    if motion.gripper_index is None:
+        detected = select_gripper_index({episode.episode_index: channel_traces(motion.action)})
+        if detected is not None:
+            motion = replace(motion, gripper_index=detected)
+    row["gripper_index"] = motion.gripper_index
+    change_points = kinematic_change_points(motion)
+    alignment = subtask_boundary_alignment(
+        boundaries, change_points, config.boundary_tolerance_frames
+    )
+    if alignment is None:
+        row["status"] = "no_change_point"
+        return row
+    reasons = boundary_alignment_findings(alignment)
+    row.update(alignment.to_dict())
+    row["status"] = "review" if reasons else "aligned"
+    row["reasons"] = list(reasons)
+    return row
 
 
 def build_annotation_episode(
@@ -225,6 +297,7 @@ def build_annotation_episode(
         videos=videos,
         task_profile=profile.to_dict() if profile is not None else None,
         semantic_context=semantic_context_from_quality_row(quality_row),
+        motion=episode_motion(metadata_config, metadata, data),
     )
     return episode, profile.task_key if profile is not None else ""
 
@@ -249,6 +322,7 @@ def write_enrichment_outputs(
     out_dir: Path,
     annotations: list[TrajectoryLanguageAnnotation],
     manifest: dict[str, Any],
+    boundary_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     annotation_rows: list[dict[str, Any]] = []
     subtask_rows: list[dict[str, Any]] = []
@@ -276,6 +350,7 @@ def write_enrichment_outputs(
     _write_jsonl(out_dir / "subtasks.jsonl", subtask_rows)
     _write_jsonl(out_dir / "events.jsonl", event_rows)
     _write_jsonl(out_dir / "state_descriptions.jsonl", description_rows)
+    _write_jsonl(out_dir / "subtask_boundary_alignment.jsonl", boundary_rows or [])
     _write_json(out_dir / "enrichment_manifest.json", manifest)
 
 
@@ -294,6 +369,7 @@ def run_language_enrichment(config: LanguageEnrichmentConfig) -> int:
 
     source = annotator_name(config.annotator)
     annotations: list[TrajectoryLanguageAnnotation] = []
+    boundary_rows: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     for episode_index in selected:
         try:
@@ -306,9 +382,9 @@ def run_language_enrichment(config: LanguageEnrichmentConfig) -> int:
                 episode_index,
             )
             result = config.annotator.annotate(episode)
-            annotations.append(
-                normalize_annotation_result(result, episode, source, task_profile)
-            )
+            annotation = normalize_annotation_result(result, episode, source, task_profile)
+            annotations.append(annotation)
+            boundary_rows.append(evaluate_boundary_alignment(config, episode, annotation))
         except Exception as exc:
             errors.append(
                 {
@@ -335,12 +411,23 @@ def run_language_enrichment(config: LanguageEnrichmentConfig) -> int:
         "errors": errors,
         "status": "complete" if not errors else "partial_failure",
         "source_dataset_modified": False,
+        "subtask_boundary_alignment": {
+            "check": config.boundary_check,
+            "tolerance_frames": config.boundary_tolerance_frames,
+            "checked": sum(row["status"] in {"aligned", "review"} for row in boundary_rows),
+            "review": sum(row["status"] == "review" for row in boundary_rows),
+            "review_episodes": [
+                row["episode_index"] for row in boundary_rows if row["status"] == "review"
+            ],
+        },
     }
-    write_enrichment_outputs(config.out_dir, annotations, manifest)
+    write_enrichment_outputs(config.out_dir, annotations, manifest, boundary_rows)
+    unaligned = manifest["subtask_boundary_alignment"]["review"]
     print(f"Dataset: {dataset_root}")
     print(f"Quality report: {quality_report}")
     print(f"Selection: {selection_mode} requested={len(selected)}")
     print(f"Annotated: {len(annotations)} errors={len(errors)}")
+    print(f"Boundary alignment: review={unaligned}")
     print(f"Output: {config.out_dir}")
     for error in errors[:20]:
         print(f"ERROR episode={error['episode_index']} {error['error']}")
@@ -383,6 +470,24 @@ def main() -> None:
     )
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--boundary-check",
+        choices=["none", "kinematic"],
+        default="kinematic",
+        help="check subtask boundaries against gripper events and arm near-stops",
+    )
+    parser.add_argument(
+        "--motion-gripper-index",
+        type=int,
+        default=None,
+        help="action dimension holding the gripper, used by the boundary check",
+    )
+    parser.add_argument(
+        "--boundary-tolerance-frames",
+        type=int,
+        default=5,
+        help="how far a boundary may sit from a change point and still count as aligned",
+    )
     args = parser.parse_args()
 
     dataset = args.dataset.resolve()
@@ -407,6 +512,9 @@ def main() -> None:
                 task_profiles=task_profiles,
                 approved_episodes=args.approved_episodes,
                 overwrite=args.overwrite,
+                boundary_check=args.boundary_check,
+                motion_gripper_index=args.motion_gripper_index,
+                boundary_tolerance_frames=args.boundary_tolerance_frames,
             )
         )
     )

@@ -6,6 +6,9 @@ The policy is conservative:
   - sampled content, distribution, and motion anomalies are marked review
   - semantic task-success checks are optional and run only when an evaluator
     plugin is explicitly configured
+  - model-free consistency checks (progress-curve shape, stage ordering, and
+    gripper actuation against the task verb) are review-only and skip themselves
+    explicitly when their preconditions are absent
 
 This script does not delete source data directly. Use the emitted keep/review/
 drop lists to build a cleaned dataset after review.
@@ -37,7 +40,23 @@ from utils.media_utils import (
     validate_png,
     video_content_metrics,
 )
+from utils.semantic_consistency import (
+    GripperTrace,
+    analyze_progress_curve,
+    build_stage_timeline,
+    channel_traces,
+    dwell_outliers,
+    gripper_pattern_findings,
+    progress_curve_findings,
+    resolve_actuation,
+    resolve_motion_signature,
+    select_gripper_index,
+    stage_timeline_findings,
+    vertical_direction_findings,
+    vertical_excursions,
+)
 from utils.semantic_evaluator import (
+    EpisodeMotion,
     SemanticEpisode,
     SemanticEvaluator,
     VideoSegment,
@@ -77,6 +96,9 @@ class AuditConfig:
     task_profiles: TaskProfileRegistry | None = None
     semantic_pass_threshold: float = 0.9
     feedback_sidecar: FeedbackSidecar | None = None
+    motion_check: str = "signature"
+    motion_gripper_index: int | None = None
+    motion_vertical_index: int | None = None
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.semantic_review_threshold <= 1.0:
@@ -85,6 +107,12 @@ class AuditConfig:
             raise ValueError("semantic pass threshold must be within [0, 1]")
         if self.semantic_review_threshold > self.semantic_pass_threshold:
             raise ValueError("semantic review threshold must not exceed semantic pass threshold")
+        if self.motion_check not in {"none", "signature"}:
+            raise ValueError("motion check must be one of: none, signature")
+        for name in ("motion_gripper_index", "motion_vertical_index"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -151,6 +179,12 @@ class AuditState:
     lengths: list[int] = field(default_factory=list)
     trajectory_hashes: dict[str, list[int]] = field(default_factory=dict)
     running_global_index: int = 0
+    channel_traces: dict[int, tuple[GripperTrace, ...]] = field(default_factory=dict)
+    episode_vertical: dict[int, tuple[float, float]] = field(default_factory=dict)
+    episode_tasks: dict[int, tuple[str, ...]] = field(default_factory=dict)
+    stage_dwell_samples: dict[tuple[str, str], list[tuple[int, float]]] = field(
+        default_factory=dict
+    )
 
     def register(self, audit: EpisodeQuality) -> None:
         self.audits.append(audit)
@@ -714,12 +748,54 @@ def semantic_videos_for_episode(
     return tuple(videos)
 
 
+def apply_progress_shape_checks(
+    result_curve: list[float], audit: EpisodeQuality
+) -> None:
+    """Read the shape of the progress curve, not only its peak and final value."""
+    metrics = analyze_progress_curve(result_curve)
+    if metrics is None:
+        audit.skip("semantic_progress_shape_not_checked")
+        return
+    audit.semantic_progress_max_drop = metrics.max_drop
+    audit.semantic_progress_idle_tail_ratio = metrics.idle_tail_ratio
+    audit.metrics["semantic_progress_metrics"] = metrics.to_dict()
+    for reason in progress_curve_findings(metrics):
+        audit.review(reason)
+
+
+def apply_stage_timeline_checks(
+    profile: TaskSemanticProfile | None,
+    result_curve: list[float],
+    details: dict[str, Any],
+    audit: EpisodeQuality,
+    audit_state: AuditState | None,
+) -> None:
+    """Assign progress points to profile stages and check their ordering."""
+    if profile is None:
+        audit.skip("semantic_stage_timeline_requires_task_profile")
+        return
+    timeline = build_stage_timeline(profile, result_curve, details)
+    if timeline is None:
+        audit.skip("semantic_stage_timeline_not_checked")
+        return
+    audit.semantic_stage_timeline_source = timeline.source
+    audit.metrics["semantic_stage_timeline"] = timeline.to_dict()
+    for reason in stage_timeline_findings(timeline):
+        audit.review(reason)
+    if audit_state is not None:
+        for stage, ratio in timeline.dwell_ratios.items():
+            audit_state.stage_dwell_samples.setdefault(
+                (profile.task_key, stage), []
+            ).append((audit.episode_index, ratio))
+
+
 def apply_semantic_evaluation(
     config: AuditConfig,
     metadata: DatasetMetadata,
     record: EpisodeRecord,
     data: pa.Table | None,
     audit: EpisodeQuality,
+    audit_state: AuditState | None = None,
 ) -> None:
     evaluator = config.semantic_evaluator
     audit.structural_status = audit.status
@@ -795,6 +871,7 @@ def apply_semantic_evaluation(
         tasks=tasks,
         videos=videos,
         task_profile=profile.to_dict() if profile is not None else None,
+        motion=episode_motion(config, metadata, data),
     )
     try:
         result = normalize_result(evaluator.evaluate(episode))
@@ -814,6 +891,11 @@ def apply_semantic_evaluation(
         audit.metrics["semantic_progress_peak"] = max(result.progress_curve)
         audit.metrics["semantic_progress_points"] = len(result.progress_curve)
 
+    apply_progress_shape_checks(audit.semantic_progress_curve, audit)
+    apply_stage_timeline_checks(
+        profile, audit.semantic_progress_curve, dict(result.details), audit, audit_state
+    )
+
     if result.score < review_threshold:
         audit.semantic_status = "review"
         audit.semantic_failure_stage = (
@@ -831,6 +913,148 @@ def apply_semantic_evaluation(
     else:
         audit.semantic_status = "pass"
         audit.semantic_failure_stage = result.failure_stage or ""
+
+
+def episode_motion(
+    config: AuditConfig, metadata: DatasetMetadata, data: pa.Table | None
+) -> EpisodeMotion:
+    """Expose the action/state streams so consistency checks can read them."""
+    action = column_matrix(data, "action", np.float64) if data is not None else None
+    state_values = (
+        column_matrix(data, "observation.state", np.float64) if data is not None else None
+    )
+    fps = metadata.info.get("fps")
+    return EpisodeMotion(
+        action=action if action is not None and action.ndim == 2 else None,
+        state=state_values if state_values is not None and state_values.ndim == 2 else None,
+        fps=float(fps) if isinstance(fps, (int, float)) else None,
+        gripper_index=config.motion_gripper_index,
+    )
+
+
+def collect_motion_signals(
+    config: AuditConfig,
+    metadata: DatasetMetadata,
+    record: EpisodeRecord,
+    data: pa.Table | None,
+    audit: EpisodeQuality,
+    audit_state: AuditState,
+) -> None:
+    """Record per-episode motion traces for the dataset-level signature check.
+
+    Findings are deferred to the distribution pass because deciding which action
+    dimension is the gripper, and whether it actuated at all, needs the whole
+    dataset rather than one episode.
+    """
+    if config.motion_check == "none":
+        audit.skip("semantic_motion_check_disabled")
+        return
+    audit_state.episode_tasks[record.episode_index] = semantic_tasks_for_episode(metadata, data)
+    motion = episode_motion(config, metadata, data)
+    if motion.action is None:
+        audit.skip("semantic_motion_action_unavailable")
+        return
+    audit_state.channel_traces[record.episode_index] = channel_traces(motion.action)
+    if config.motion_vertical_index is not None and (
+        0 <= config.motion_vertical_index < motion.action.shape[1]
+    ):
+        audit_state.episode_vertical[record.episode_index] = vertical_excursions(
+            motion.action[:, config.motion_vertical_index]
+        )
+
+
+def apply_motion_reviews(config: AuditConfig, state: AuditState) -> dict[str, Any]:
+    """Compare each episode's gripper actuation against its instruction verb."""
+    summary: dict[str, Any] = {
+        "enabled": config.motion_check != "none",
+        "gripper_index": None,
+        "gripper_index_source": "unresolved",
+        "vertical_index": config.motion_vertical_index,
+        "episodes_checked": 0,
+        "verb_unmatched": 0,
+        "signature_conflicts": 0,
+    }
+    if config.motion_check == "none" or not state.channel_traces:
+        return summary
+
+    gripper_index = config.motion_gripper_index
+    if gripper_index is not None:
+        summary["gripper_index_source"] = "configured"
+    else:
+        gripper_index = select_gripper_index(state.channel_traces)
+        if gripper_index is not None:
+            summary["gripper_index_source"] = "detected"
+    summary["gripper_index"] = gripper_index
+    if gripper_index is None:
+        for audit in state.audits:
+            audit.skip("semantic_motion_gripper_channel_unresolved")
+        return summary
+
+    spans = [
+        trace.span
+        for traces in state.channel_traces.values()
+        for trace in traces
+        if trace.index == gripper_index
+    ]
+    median_span = float(np.median(spans)) if spans else 0.0
+
+    for audit in state.audits:
+        episode_index = audit.episode_index
+        traces = state.channel_traces.get(episode_index)
+        if traces is None:
+            continue
+        tasks = state.episode_tasks.get(episode_index, ())
+        signature = resolve_motion_signature(tasks)
+        if signature is None:
+            audit.skip("semantic_motion_verb_unmatched")
+            summary["verb_unmatched"] += 1
+            continue
+        audit.semantic_motion_verbs = ";".join(signature.names)
+        if signature.conflicted:
+            audit.skip("semantic_motion_signature_conflict")
+            audit.metrics["semantic_motion"] = {"signature": signature.to_dict()}
+            summary["signature_conflicts"] += 1
+            continue
+        trace = resolve_actuation(traces, gripper_index, median_span)
+        if trace is None:
+            audit.skip("semantic_motion_gripper_channel_unresolved")
+            continue
+
+        summary["episodes_checked"] += 1
+        audit.semantic_motion_gripper_transitions = trace.transitions
+        motion_metrics: dict[str, Any] = {
+            "signature": signature.to_dict(),
+            "gripper": trace.to_dict(),
+            "gripper_index_source": summary["gripper_index_source"],
+        }
+        pattern_reasons, pattern_metrics = gripper_pattern_findings(signature, trace)
+        motion_metrics.update(pattern_metrics)
+        excursions = state.episode_vertical.get(episode_index)
+        vertical_reasons, vertical_metrics = vertical_direction_findings(
+            signature,
+            excursions,
+            config.motion_vertical_index if excursions is not None else -1,
+        )
+        if vertical_metrics:
+            motion_metrics["vertical"] = vertical_metrics
+        elif signature.vertical_direction:
+            audit.skip("semantic_motion_vertical_axis_not_configured")
+        audit.metrics["semantic_motion"] = motion_metrics
+        for reason in (*pattern_reasons, *vertical_reasons):
+            audit.review(reason)
+    return summary
+
+
+def apply_stage_dwell_reviews(state: AuditState) -> int:
+    """Flag stage durations that are far from their task/stage median."""
+    flagged = dwell_outliers(state.stage_dwell_samples)
+    for episode_index, deviations in flagged.items():
+        audit = state.audits_by_episode.get(episode_index)
+        if audit is None:
+            continue
+        audit.metrics["semantic_stage_dwell_outliers"] = deviations
+        audit.review("semantic_stage_dwell_outlier_review")
+    return len(flagged)
 
 
 def apply_feedback_validation(
@@ -913,7 +1137,8 @@ def audit_episode(
     audit_depth_sidecars(config, metadata, record, data, audit)
     audit_video_files(config, metadata, runtime, caches, record, audit)
     apply_feedback_validation(config, record, audit)
-    apply_semantic_evaluation(config, metadata, record, data, audit)
+    collect_motion_signals(config, metadata, record, data, audit, audit_state)
+    apply_semantic_evaluation(config, metadata, record, data, audit, audit_state)
 
 
 def apply_distribution_reviews(audits: list[EpisodeQuality], state: AuditState) -> dict[str, float | None]:
@@ -961,6 +1186,8 @@ def build_summary(
     global_errors: list[str],
     thresholds: dict[str, float | None],
     fingerprint: str | None = None,
+    motion_summary: dict[str, Any] | None = None,
+    stage_dwell_outliers: int = 0,
 ) -> dict[str, Any]:
     keep = [a.episode_index for a in audits if a.status == "keep"]
     review = [a.episode_index for a in audits if a.status == "review"]
@@ -1003,6 +1230,35 @@ def build_summary(
             ),
             "errors": sum(a.semantic_status == "error" for a in audits),
             "skipped": sum(a.semantic_status.startswith("skipped") for a in audits),
+        },
+        "semantic_consistency": {
+            "progress_regression_review": sum(
+                "semantic_progress_regression_review" in a.review_reasons for a in audits
+            ),
+            "progress_idle_tail_review": sum(
+                "semantic_progress_idle_tail_review" in a.review_reasons for a in audits
+            ),
+            "progress_idle_head_review": sum(
+                "semantic_progress_idle_head_review" in a.review_reasons for a in audits
+            ),
+            "stage_order_violation_review": sum(
+                "semantic_stage_order_violation_review" in a.review_reasons for a in audits
+            ),
+            "stage_skipped_review": sum(
+                "semantic_stage_skipped_review" in a.review_reasons for a in audits
+            ),
+            "stage_unknown_review": sum(
+                "semantic_stage_unknown_review" in a.review_reasons for a in audits
+            ),
+            "stage_dwell_outlier_review": stage_dwell_outliers,
+            "motion_gripper_pattern_review": sum(
+                "semantic_motion_gripper_pattern_review" in a.review_reasons for a in audits
+            ),
+            "motion_vertical_direction_review": sum(
+                "semantic_motion_vertical_direction_review" in a.review_reasons for a in audits
+            ),
+            "motion": motion_summary
+            or {"enabled": config.motion_check != "none", "episodes_checked": 0},
         },
         "feedback_validation": {
             "enabled": config.feedback_sidecar is not None,
@@ -1065,6 +1321,8 @@ def run_audit(config: AuditConfig) -> int:
 
     thresholds = apply_distribution_reviews(state.audits, state)
     apply_duplicate_reviews(state, config.duplicate_check)
+    motion_summary = apply_motion_reviews(config, state)
+    stage_dwell_outliers = apply_stage_dwell_reviews(state)
     refresh_structural_status(state.audits)
     summary = build_summary(
         config,
@@ -1074,6 +1332,8 @@ def run_audit(config: AuditConfig) -> int:
         global_errors,
         thresholds,
         fingerprint=dataset_fingerprint(config.root),
+        motion_summary=motion_summary,
+        stage_dwell_outliers=stage_dwell_outliers,
     )
     write_quality_outputs(config.out_dir, state.audits, summary)
     print_audit_summary(config, state.audits, summary)
@@ -1095,6 +1355,9 @@ def audit_dataset(
     task_profiles: TaskProfileRegistry | None = None,
     semantic_pass_threshold: float = 0.9,
     feedback_sidecar: FeedbackSidecar | Path | None = None,
+    motion_check: str = "signature",
+    motion_gripper_index: int | None = None,
+    motion_vertical_index: int | None = None,
 ) -> int:
     """Run the quality audit; kept for compatibility with existing utility scripts."""
     if not 0.0 <= semantic_review_threshold <= 1.0:
@@ -1123,6 +1386,9 @@ def audit_dataset(
         semantic_pass_threshold=semantic_pass_threshold,
         task_profiles=task_profiles,
         feedback_sidecar=resolved_feedback,
+        motion_check=motion_check,
+        motion_gripper_index=motion_gripper_index,
+        motion_vertical_index=motion_vertical_index,
     )
     return run_audit(config)
 
@@ -1218,12 +1484,25 @@ def load_prior_audits(report_path: Path) -> dict[int, EpisodeQuality]:
     return audits
 
 
-def read_task_index_data(root: Path, record: EpisodeRecord) -> pa.Table | None:
+def read_semantic_columns(root: Path, record: EpisodeRecord) -> pa.Table | None:
+    """Read only the columns semantic and motion checks need.
+
+    Action and state are included so a semantic-only rerun still performs the
+    action/language consistency checks; media payloads are never touched.
+    """
     data_path = (
         root / "data" / f"chunk-{record.data_chunk:03d}" / f"file-{record.data_file:03d}.parquet"
     )
+    wanted = ["task_index", "action", "observation.state"]
     try:
-        return pq.read_table(data_path, columns=["task_index"])
+        available = pq.read_schema(data_path).names
+    except Exception:
+        return None
+    columns = [name for name in wanted if name in available]
+    if not columns:
+        return None
+    try:
+        return pq.read_table(data_path, columns=columns)
     except Exception:
         return None
 
@@ -1310,8 +1589,11 @@ def run_semantic_reuse(config: AuditConfig, report_path: Path) -> int:
             )
         state.register(audit)
         audit.skip("structural_checks_reused_from_prior_report")
-        data = read_task_index_data(config.root, record)
-        apply_semantic_evaluation(config, metadata, record, data, audit)
+        data = read_semantic_columns(config.root, record)
+        collect_motion_signals(config, metadata, record, data, audit, state)
+        apply_semantic_evaluation(config, metadata, record, data, audit, state)
+    motion_summary = apply_motion_reviews(config, state)
+    stage_dwell_outliers = apply_stage_dwell_reviews(state)
     refresh_structural_status(state.audits)
     runtime = AuditRuntime(
         video_check="reused_prior_report",
@@ -1327,6 +1609,8 @@ def run_semantic_reuse(config: AuditConfig, report_path: Path) -> int:
         global_errors,
         {},
         fingerprint=current_fingerprint,
+        motion_summary=motion_summary,
+        stage_dwell_outliers=stage_dwell_outliers,
     )
     summary["audit_mode"] = "semantic_reuse"
     summary["reused_report"] = str(report_path)
@@ -1346,6 +1630,9 @@ def audit_dataset_semantic_reuse(
     semantic_review_threshold: float = 0.5,
     semantic_pass_threshold: float = 0.9,
     task_profiles: TaskProfileRegistry | None = None,
+    motion_check: str = "signature",
+    motion_gripper_index: int | None = None,
+    motion_vertical_index: int | None = None,
 ) -> int:
     """Rerun only semantic evaluation against an existing structural report."""
     config = AuditConfig(
@@ -1362,6 +1649,9 @@ def audit_dataset_semantic_reuse(
         semantic_review_threshold=semantic_review_threshold,
         semantic_pass_threshold=semantic_pass_threshold,
         task_profiles=task_profiles,
+        motion_check=motion_check,
+        motion_gripper_index=motion_gripper_index,
+        motion_vertical_index=motion_vertical_index,
     )
     report_path = reuse_report or (out_dir / "quality_report.csv")
     return run_semantic_reuse(config, report_path)
@@ -1378,6 +1668,33 @@ def main() -> None:
     parser.add_argument("--video-sample-stride", type=int, default=300)
     parser.add_argument("--depth-sample-frames", type=int, default=8)
     parser.add_argument("--duplicate-check", choices=["none", "trajectory"], default="trajectory")
+    parser.add_argument(
+        "--motion-check",
+        choices=["none", "signature"],
+        default="signature",
+        help=(
+            "compare gripper actuation against the verb in the task text; "
+            "needs no model and skips itself when the verb is unknown"
+        ),
+    )
+    parser.add_argument(
+        "--motion-gripper-index",
+        type=int,
+        default=None,
+        help=(
+            "action dimension holding the gripper; "
+            "auto-detected from bimodal channel behaviour when omitted"
+        ),
+    )
+    parser.add_argument(
+        "--motion-vertical-index",
+        type=int,
+        default=None,
+        help=(
+            "action dimension that moves vertically; enables direction checks "
+            "for verbs such as lift and press, which are skipped when omitted"
+        ),
+    )
     parser.add_argument(
         "--semantic-evaluator",
         default=None,
@@ -1458,6 +1775,9 @@ def main() -> None:
                 semantic_review_threshold=args.semantic_review_threshold,
                 semantic_pass_threshold=args.semantic_pass_threshold,
                 task_profiles=task_profiles,
+                motion_check=args.motion_check,
+                motion_gripper_index=args.motion_gripper_index,
+                motion_vertical_index=args.motion_vertical_index,
             )
         )
     raise SystemExit(
@@ -1476,6 +1796,9 @@ def main() -> None:
             semantic_pass_threshold=args.semantic_pass_threshold,
             task_profiles=task_profiles,
             feedback_sidecar=args.feedback_sidecar,
+            motion_check=args.motion_check,
+            motion_gripper_index=args.motion_gripper_index,
+            motion_vertical_index=args.motion_vertical_index,
         )
     )
 

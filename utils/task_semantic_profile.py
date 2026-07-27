@@ -176,20 +176,31 @@ class TaskSemanticProfile:
     def effective_pass_threshold(self, default: float) -> float:
         return self.pass_threshold if self.pass_threshold is not None else default
 
-    def infer_failure_stage(self, progress_curve: Sequence[float]) -> str:
+    def stage_at_progress(self, value: float) -> str:
+        """Map one progress value to the stage whose weight band contains it."""
         if not self.stages:
             return "final_outcome"
-        if not progress_curve:
-            return self.stages[-1].name
-        peak = max(float(value) for value in progress_curve)
         total_weight = sum(stage.weight for stage in self.stages)
-        completed_weight = peak * total_weight
+        completed_weight = float(value) * total_weight
         running = 0.0
         for stage in self.stages:
             running += stage.weight
             if completed_weight < running:
                 return stage.name
         return self.stages[-1].name
+
+    def stage_rank(self, name: str) -> int | None:
+        for index, stage in enumerate(self.stages):
+            if stage.name == name:
+                return index
+        return None
+
+    def infer_failure_stage(self, progress_curve: Sequence[float]) -> str:
+        if not self.stages:
+            return "final_outcome"
+        if not progress_curve:
+            return self.stages[-1].name
+        return self.stage_at_progress(max(float(value) for value in progress_curve))
 
     def to_dict(self) -> dict[str, Any]:
         return {

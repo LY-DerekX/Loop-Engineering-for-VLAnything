@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from utils.semantic_evaluator import VideoSegment
+from utils.semantic_evaluator import EpisodeMotion, VideoSegment
 
 
 LANGUAGE_ANNOTATION_SCHEMA_VERSION = 1
@@ -309,6 +309,7 @@ class LanguageAnnotationEpisode:
     videos: tuple[VideoSegment, ...]
     task_profile: Mapping[str, Any] | None = None
     semantic_context: Mapping[str, Any] = field(default_factory=dict)
+    motion: EpisodeMotion | None = None
 
 
 @runtime_checkable
