@@ -378,6 +378,36 @@ An evaluator also receives the episode's action and state arrays through
 `episode.motion`, so a backend can compare what the instruction says against
 what the arm actually did without re-reading parquet.
 
+Task text is resolved from `meta/tasks.parquet` whether the string lives in an
+explicit `task` column or in the pandas index artifact `__index_level_0__`, and
+episode rows are located correctly in both layouts: one parquet file per
+episode (merge outputs) and aggregated files holding many episodes (recorded
+v3 datasets), sliced by the episode's global frame range.
+
+### Score reliability contracts
+
+Three optional contracts let a backend say how much its own score should be
+trusted; each is review-only and reports itself as not-checked when unused:
+
+- **Sampling dispersion**: return `score_samples` (repeated scorings across
+  temperatures or frame subsets) or an explicit `score_std`. Dispersion at or
+  above `--semantic-uncertainty-threshold` (default 0.15) demotes a pass to
+  review as `semantic_score_unstable_review`. A backend that returns only
+  samples gets `success_probability` derived as their mean.
+- **Counterfactual margin**: return `details.counterfactual_margin` — the score
+  of the true instruction minus the best score among deliberately corrupted
+  instructions (swapped object, swapped target, reversed direction). A margin
+  below `--semantic-counterfactual-margin-threshold` (default 0.10) is reviewed
+  as `semantic_counterfactual_margin_low_review`: the episode is mislabeled,
+  ambiguous, or the evaluator cannot discriminate. Distractor generation stays
+  in the backend.
+- **Per-view agreement**: pass `--semantic-per-view` to additionally score each
+  camera view separately (one extra evaluator call per view). A gap at or above
+  `--semantic-view-disagreement-threshold` (default 0.30) between views is
+  reviewed as `semantic_view_disagreement_review` — one camera saw something
+  the other did not, so neither single score should be trusted. The combined
+  result stays authoritative.
+
 Semantic output is added directly to quality_report.csv:
 
 - semantic_progress_curve_json
@@ -390,6 +420,8 @@ Semantic output is added directly to quality_report.csv:
 - semantic_progress_max_drop and semantic_progress_idle_tail_ratio
 - semantic_stage_timeline_source
 - semantic_motion_verbs and semantic_motion_gripper_transitions
+- semantic_score_uncertainty, semantic_view_disagreement, and
+  semantic_counterfactual_margin
 
 Success probability is used as the review score when provided; otherwise the
 last progress value is used. The default decision bands are:

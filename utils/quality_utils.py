@@ -39,6 +39,9 @@ class EpisodeQuality:
     semantic_stage_timeline_source: str = ""
     semantic_motion_verbs: str = ""
     semantic_motion_gripper_transitions: int | None = None
+    semantic_score_uncertainty: float | None = None
+    semantic_view_disagreement: float | None = None
+    semantic_counterfactual_margin: float | None = None
     status: str = "keep"
     drop_reasons: list[str] = field(default_factory=list)
     review_reasons: list[str] = field(default_factory=list)
@@ -183,6 +186,9 @@ def write_quality_outputs(out_dir: Path, audits: list[EpisodeQuality], summary: 
         "semantic_stage_timeline_source",
         "semantic_motion_verbs",
         "semantic_motion_gripper_transitions",
+        "semantic_score_uncertainty",
+        "semantic_view_disagreement",
+        "semantic_counterfactual_margin",
         "length",
         "data_rows",
         "depth_files",
@@ -232,6 +238,21 @@ def write_quality_outputs(out_dir: Path, audits: list[EpisodeQuality], summary: 
                         ""
                         if audit.semantic_motion_gripper_transitions is None
                         else audit.semantic_motion_gripper_transitions
+                    ),
+                    "semantic_score_uncertainty": (
+                        ""
+                        if audit.semantic_score_uncertainty is None
+                        else audit.semantic_score_uncertainty
+                    ),
+                    "semantic_view_disagreement": (
+                        ""
+                        if audit.semantic_view_disagreement is None
+                        else audit.semantic_view_disagreement
+                    ),
+                    "semantic_counterfactual_margin": (
+                        ""
+                        if audit.semantic_counterfactual_margin is None
+                        else audit.semantic_counterfactual_margin
                     ),
                     "episode_index": audit.episode_index,
                     "status": audit.status,
