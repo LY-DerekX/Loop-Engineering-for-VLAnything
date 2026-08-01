@@ -12,7 +12,7 @@ import inspect
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -67,12 +67,27 @@ class SemanticEpisode:
 
 @dataclass(frozen=True)
 class SemanticResult:
-    """Normalized semantic assessment returned by an evaluator."""
+    """Normalized semantic assessment returned by an evaluator.
+
+    Reliability contracts, all optional:
+
+    - `score_samples` / `score_std`: repeated scorings of the same episode
+      (multi-temperature or multi-frame sampling). Their dispersion becomes the
+      score's uncertainty; a backend that samples but reports no point estimate
+      gets `success_probability` derived as the sample mean.
+    - `details["counterfactual_margin"]`: score(true instruction) minus the best
+      score among deliberately corrupted instructions (swapped object, swapped
+      target, reversed direction). A small or negative margin means the episode
+      is mislabeled, ambiguous, or the evaluator cannot discriminate — the audit
+      reviews it either way.
+    """
 
     progress_curve: tuple[float, ...] = ()
     success_probability: float | None = None
     failure_stage: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    score_samples: tuple[float, ...] = ()
+    score_std: float | None = None
 
     @property
     def final_progress(self) -> float | None:
@@ -86,6 +101,20 @@ class SemanticResult:
         if self.final_progress is not None:
             return self.final_progress
         raise ValueError("semantic result has neither success probability nor progress")
+
+    @property
+    def uncertainty(self) -> float | None:
+        """Score dispersion: explicit std wins, else the std of the samples."""
+        if self.score_std is not None:
+            return self.score_std
+        if len(self.score_samples) >= 2:
+            return float(np.std(np.asarray(self.score_samples, dtype=np.float64)))
+        return None
+
+    @property
+    def counterfactual_margin(self) -> float | None:
+        value = self.details.get("counterfactual_margin")
+        return None if value is None else float(value)
 
 
 @runtime_checkable
@@ -139,23 +168,26 @@ def load_evaluator_config(path: Path | None) -> dict[str, Any]:
     return payload
 
 
+def _float_sequence(value: Any, field_name: str) -> tuple[float, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError(f"{field_name} must be a numeric sequence")
+    return tuple(float(item) for item in value)
+
+
 def normalize_result(value: SemanticResult | Mapping[str, Any]) -> SemanticResult:
     """Validate backend output and return a stable result object."""
     if isinstance(value, SemanticResult):
         result = value
     elif isinstance(value, Mapping):
-        raw_curve = value.get("progress_curve", ())
-        if raw_curve is None:
-            raw_curve = ()
-        if isinstance(raw_curve, (str, bytes)) or not isinstance(raw_curve, Sequence):
-            raise TypeError("progress_curve must be a numeric sequence")
         raw_details = value.get("details", {})
         if raw_details is None:
             raw_details = {}
         if not isinstance(raw_details, Mapping):
             raise TypeError("semantic result details must be a mapping")
         result = SemanticResult(
-            progress_curve=tuple(float(item) for item in raw_curve),
+            progress_curve=_float_sequence(value.get("progress_curve"), "progress_curve"),
             success_probability=(
                 None if value.get("success_probability") is None else float(value["success_probability"])
             ),
@@ -163,19 +195,42 @@ def normalize_result(value: SemanticResult | Mapping[str, Any]) -> SemanticResul
                 None if value.get("failure_stage") in {None, ""} else str(value["failure_stage"])
             ),
             details=dict(raw_details),
+            score_samples=_float_sequence(value.get("score_samples"), "score_samples"),
+            score_std=(
+                None if value.get("score_std") is None else float(value["score_std"])
+            ),
         )
     else:
         raise TypeError("semantic evaluator must return SemanticResult or a mapping")
 
+    if result.success_probability is None and result.score_samples:
+        result = replace(
+            result,
+            success_probability=sum(result.score_samples) / len(result.score_samples),
+        )
+
     for item in result.progress_curve:
         if not math.isfinite(item) or not 0.0 <= item <= 1.0:
             raise ValueError("progress_curve values must be finite and within [0, 1]")
+    for item in result.score_samples:
+        if not math.isfinite(item) or not 0.0 <= item <= 1.0:
+            raise ValueError("score_samples values must be finite and within [0, 1]")
+    if result.score_std is not None and (
+        not math.isfinite(result.score_std) or result.score_std < 0.0
+    ):
+        raise ValueError("score_std must be finite and non-negative")
     if result.success_probability is not None:
         probability = result.success_probability
         if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
             raise ValueError("success_probability must be finite and within [0, 1]")
     if not result.progress_curve and result.success_probability is None:
         raise ValueError("semantic result must provide progress_curve or success_probability")
+
+    margin_value = result.details.get("counterfactual_margin")
+    if margin_value is not None:
+        margin = float(margin_value)
+        if not math.isfinite(margin) or not -1.0 <= margin <= 1.0:
+            raise ValueError("counterfactual_margin must be finite and within [-1, 1]")
 
     json.dumps(result.details, ensure_ascii=False)
     return result

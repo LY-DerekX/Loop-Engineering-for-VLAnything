@@ -20,12 +20,13 @@ import argparse
 import csv
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from utils.dataset_io import discover_reparse_paths, is_reparse_path, read_json, safe_rel_path
@@ -59,6 +60,7 @@ from utils.semantic_evaluator import (
     EpisodeMotion,
     SemanticEpisode,
     SemanticEvaluator,
+    SemanticResult,
     VideoSegment,
     evaluator_name,
     infer_failure_stage,
@@ -99,6 +101,10 @@ class AuditConfig:
     motion_check: str = "signature"
     motion_gripper_index: int | None = None
     motion_vertical_index: int | None = None
+    semantic_per_view: bool = False
+    semantic_view_disagreement_threshold: float = 0.30
+    semantic_uncertainty_threshold: float = 0.15
+    semantic_counterfactual_margin_threshold: float = 0.10
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.semantic_review_threshold <= 1.0:
@@ -113,6 +119,13 @@ class AuditConfig:
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative")
+        for name in (
+            "semantic_view_disagreement_threshold",
+            "semantic_uncertainty_threshold",
+            "semantic_counterfactual_margin_threshold",
+        ):
+            if not 0.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must be within [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -168,6 +181,9 @@ class AuditCaches:
     video_probe: dict[Path, tuple[bool, str]] = field(default_factory=dict)
     video_decode: dict[Path, tuple[bool, str]] = field(default_factory=dict)
     video_content: dict[Path, tuple[dict[str, float] | None, str]] = field(default_factory=dict)
+    # Aggregated-layout data files hold many episodes; keep only the most recent
+    # file in memory since episodes are audited in file order.
+    episode_data: dict[Path, pa.Table] = field(default_factory=dict)
 
 
 @dataclass
@@ -343,11 +359,34 @@ def requested_data_columns(depth_keys: list[str]) -> list[str]:
     return columns
 
 
+def slice_episode_rows(data: pa.Table, record: EpisodeRecord) -> pa.Table:
+    """Select one episode's rows from an aggregated LeRobot v3 data file.
+
+    Recorded datasets pack many episodes into each parquet file; only merge
+    outputs keep one file per episode. When the file holds more rows than the
+    episode, its rows are selected by the episode's global frame range using the
+    `index` column. The slice is returned as-is: validate_index_columns still
+    verifies its length and contiguity, so a corrupt index column surfaces as
+    the usual structural drops instead of being silently accepted.
+    """
+    if data.num_rows == record.length or "index" not in data.column_names:
+        return data
+    try:
+        mask = pc.and_(
+            pc.greater_equal(data["index"], record.dataset_from),
+            pc.less(data["index"], record.dataset_to),
+        )
+        return data.filter(mask)
+    except Exception:
+        return data
+
+
 def read_episode_data(
     root: Path,
     record: EpisodeRecord,
     depth_keys: list[str],
     audit: EpisodeQuality,
+    caches: AuditCaches | None = None,
 ) -> pa.Table | None:
     data_path = root / "data" / f"chunk-{record.data_chunk:03d}" / f"file-{record.data_file:03d}.parquet"
     if not data_path.exists():
@@ -356,11 +395,17 @@ def read_episode_data(
     if data_path.is_symlink() or is_reparse_path(data_path):
         audit.drop(f"data_parquet_is_link:{data_path}")
         return None
-    try:
-        data = pq.read_table(data_path, columns=requested_data_columns(depth_keys))
-    except Exception as exc:
-        audit.drop(f"cannot_read_data_parquet:{type(exc).__name__}")
-        return None
+    data = caches.episode_data.get(data_path) if caches is not None else None
+    if data is None:
+        try:
+            data = pq.read_table(data_path, columns=requested_data_columns(depth_keys))
+        except Exception as exc:
+            audit.drop(f"cannot_read_data_parquet:{type(exc).__name__}")
+            return None
+        if caches is not None:
+            caches.episode_data.clear()
+            caches.episode_data[data_path] = data
+    data = slice_episode_rows(data, record)
     audit.data_rows = data.num_rows
     return data
 
@@ -705,14 +750,32 @@ def review_video_content_if_requested(
         audit.skip("video_content_not_checked")
 
 
+TASK_TEXT_COLUMNS = ("task", "__index_level_0__")
+
+
+def task_text_column(tasks: pa.Table) -> str | None:
+    """Locate the task-text column in tasks.parquet.
+
+    LeRobot writes the task string either as an explicit `task` column or, when
+    the table was saved from a pandas frame indexed by task text, as the pandas
+    index artifact `__index_level_0__`. Both forms appear in real datasets, so
+    both are accepted, with the explicit column preferred.
+    """
+    for name in TASK_TEXT_COLUMNS:
+        if name in tasks.column_names:
+            return name
+    return None
+
+
 def semantic_tasks_for_episode(metadata: DatasetMetadata, data: pa.Table | None) -> tuple[str, ...]:
     if data is None or "task_index" not in data.column_names:
         return ()
-    if "task_index" not in metadata.tasks.column_names or "task" not in metadata.tasks.column_names:
+    text_column = task_text_column(metadata.tasks)
+    if "task_index" not in metadata.tasks.column_names or text_column is None:
         return ()
     task_map = {
         int(index.as_py()): str(text.as_py())
-        for index, text in zip(metadata.tasks["task_index"], metadata.tasks["task"])
+        for index, text in zip(metadata.tasks["task_index"], metadata.tasks[text_column])
     }
     ordered: list[str] = []
     for value in data["task_index"]:
@@ -787,6 +850,75 @@ def apply_stage_timeline_checks(
             audit_state.stage_dwell_samples.setdefault(
                 (profile.task_key, stage), []
             ).append((audit.episode_index, ratio))
+
+
+def apply_score_reliability_checks(
+    config: AuditConfig, result: SemanticResult, audit: EpisodeQuality
+) -> None:
+    """Judge how much the score itself can be trusted, not only its value.
+
+    Both signals are contracts a backend may or may not fill: the dispersion of
+    repeated scorings, and the margin over deliberately corrupted instructions.
+    A high score that is unstable across samples, or that a distractor
+    instruction nearly ties, is demoted to review.
+    """
+    uncertainty = result.uncertainty
+    if uncertainty is None:
+        audit.skip("semantic_score_stability_not_checked")
+    else:
+        audit.semantic_score_uncertainty = uncertainty
+        audit.metrics["semantic_score_uncertainty"] = uncertainty
+        if result.score_samples:
+            audit.metrics["semantic_score_samples"] = list(result.score_samples)
+        if uncertainty >= config.semantic_uncertainty_threshold:
+            audit.semantic_status = "review"
+            audit.review("semantic_score_unstable_review")
+
+    margin = result.counterfactual_margin
+    if margin is None:
+        audit.skip("semantic_counterfactual_not_checked")
+    else:
+        audit.semantic_counterfactual_margin = margin
+        if margin < config.semantic_counterfactual_margin_threshold:
+            audit.semantic_status = "review"
+            audit.review("semantic_counterfactual_margin_low_review")
+
+
+def apply_per_view_evaluation(
+    config: AuditConfig,
+    evaluator: SemanticEvaluator,
+    episode: SemanticEpisode,
+    audit: EpisodeQuality,
+) -> None:
+    """Score each camera view separately and compare the verdicts.
+
+    A large gap between views means occlusion or hallucination: one camera saw
+    something the other did not, so neither single score should be trusted. The
+    combined result stays authoritative; this is a diagnostic that costs one
+    extra evaluator call per view.
+    """
+    if not config.semantic_per_view:
+        return
+    if len(episode.videos) < 2:
+        audit.skip("semantic_view_disagreement_single_view")
+        return
+    view_scores: dict[str, float] = {}
+    for video in episode.videos:
+        try:
+            view_result = normalize_result(evaluator.evaluate(replace(episode, videos=(video,))))
+            view_scores[video.key] = view_result.score
+        except Exception as exc:
+            audit.metrics["semantic_view_error"] = (
+                f"{video.key}:{type(exc).__name__}:{str(exc)[:200]}"
+            )
+            audit.skip("semantic_view_disagreement_error")
+            return
+    disagreement = max(view_scores.values()) - min(view_scores.values())
+    audit.semantic_view_disagreement = disagreement
+    audit.metrics["semantic_view_scores"] = view_scores
+    if disagreement >= config.semantic_view_disagreement_threshold:
+        audit.semantic_status = "review"
+        audit.review("semantic_view_disagreement_review")
 
 
 def apply_semantic_evaluation(
@@ -913,6 +1045,9 @@ def apply_semantic_evaluation(
     else:
         audit.semantic_status = "pass"
         audit.semantic_failure_stage = result.failure_stage or ""
+
+    apply_score_reliability_checks(config, result, audit)
+    apply_per_view_evaluation(config, evaluator, episode, audit)
 
 
 def episode_motion(
@@ -1131,7 +1266,7 @@ def audit_episode(
     audit = EpisodeQuality(episode_index=record.episode_index, length=record.length)
     audit_state.register(audit)
     validate_episode_ranges(record, audit, audit_state)
-    data = read_episode_data(config.root, record, metadata.depth_keys, audit)
+    data = read_episode_data(config.root, record, metadata.depth_keys, audit, caches)
     if data is not None:
         audit_numeric_data(data, metadata, record, audit, audit_state)
     audit_depth_sidecars(config, metadata, record, data, audit)
@@ -1218,6 +1353,10 @@ def build_summary(
             ),
             "review_threshold": config.semantic_review_threshold,
             "pass_threshold": config.semantic_pass_threshold,
+            "per_view": config.semantic_per_view,
+            "view_disagreement_threshold": config.semantic_view_disagreement_threshold,
+            "uncertainty_threshold": config.semantic_uncertainty_threshold,
+            "counterfactual_margin_threshold": config.semantic_counterfactual_margin_threshold,
             "task_profiles_enabled": config.task_profiles is not None,
             "task_profile_count": len(config.task_profiles.profiles) if config.task_profiles else 0,
             "pass": sum(a.semantic_status == "pass" for a in audits),
@@ -1256,6 +1395,15 @@ def build_summary(
             ),
             "motion_vertical_direction_review": sum(
                 "semantic_motion_vertical_direction_review" in a.review_reasons for a in audits
+            ),
+            "score_unstable_review": sum(
+                "semantic_score_unstable_review" in a.review_reasons for a in audits
+            ),
+            "view_disagreement_review": sum(
+                "semantic_view_disagreement_review" in a.review_reasons for a in audits
+            ),
+            "counterfactual_margin_low_review": sum(
+                "semantic_counterfactual_margin_low_review" in a.review_reasons for a in audits
             ),
             "motion": motion_summary
             or {"enabled": config.motion_check != "none", "episodes_checked": 0},
@@ -1358,6 +1506,10 @@ def audit_dataset(
     motion_check: str = "signature",
     motion_gripper_index: int | None = None,
     motion_vertical_index: int | None = None,
+    semantic_per_view: bool = False,
+    semantic_view_disagreement_threshold: float = 0.30,
+    semantic_uncertainty_threshold: float = 0.15,
+    semantic_counterfactual_margin_threshold: float = 0.10,
 ) -> int:
     """Run the quality audit; kept for compatibility with existing utility scripts."""
     if not 0.0 <= semantic_review_threshold <= 1.0:
@@ -1389,6 +1541,10 @@ def audit_dataset(
         motion_check=motion_check,
         motion_gripper_index=motion_gripper_index,
         motion_vertical_index=motion_vertical_index,
+        semantic_per_view=semantic_per_view,
+        semantic_view_disagreement_threshold=semantic_view_disagreement_threshold,
+        semantic_uncertainty_threshold=semantic_uncertainty_threshold,
+        semantic_counterfactual_margin_threshold=semantic_counterfactual_margin_threshold,
     )
     return run_audit(config)
 
@@ -1493,7 +1649,7 @@ def read_semantic_columns(root: Path, record: EpisodeRecord) -> pa.Table | None:
     data_path = (
         root / "data" / f"chunk-{record.data_chunk:03d}" / f"file-{record.data_file:03d}.parquet"
     )
-    wanted = ["task_index", "action", "observation.state"]
+    wanted = ["task_index", "action", "observation.state", "index"]
     try:
         available = pq.read_schema(data_path).names
     except Exception:
@@ -1502,7 +1658,7 @@ def read_semantic_columns(root: Path, record: EpisodeRecord) -> pa.Table | None:
     if not columns:
         return None
     try:
-        return pq.read_table(data_path, columns=columns)
+        return slice_episode_rows(pq.read_table(data_path, columns=columns), record)
     except Exception:
         return None
 
@@ -1633,6 +1789,10 @@ def audit_dataset_semantic_reuse(
     motion_check: str = "signature",
     motion_gripper_index: int | None = None,
     motion_vertical_index: int | None = None,
+    semantic_per_view: bool = False,
+    semantic_view_disagreement_threshold: float = 0.30,
+    semantic_uncertainty_threshold: float = 0.15,
+    semantic_counterfactual_margin_threshold: float = 0.10,
 ) -> int:
     """Rerun only semantic evaluation against an existing structural report."""
     config = AuditConfig(
@@ -1652,6 +1812,10 @@ def audit_dataset_semantic_reuse(
         motion_check=motion_check,
         motion_gripper_index=motion_gripper_index,
         motion_vertical_index=motion_vertical_index,
+        semantic_per_view=semantic_per_view,
+        semantic_view_disagreement_threshold=semantic_view_disagreement_threshold,
+        semantic_uncertainty_threshold=semantic_uncertainty_threshold,
+        semantic_counterfactual_margin_threshold=semantic_counterfactual_margin_threshold,
     )
     report_path = reuse_report or (out_dir / "quality_report.csv")
     return run_semantic_reuse(config, report_path)
@@ -1722,6 +1886,38 @@ def main() -> None:
         help="only scores at or above this value receive automatic semantic pass",
     )
     parser.add_argument(
+        "--semantic-per-view",
+        action="store_true",
+        help=(
+            "additionally score each camera view separately and review episodes "
+            "whose views disagree; costs one extra evaluator call per view"
+        ),
+    )
+    parser.add_argument(
+        "--semantic-view-disagreement-threshold",
+        type=float,
+        default=0.30,
+        help="per-view score gap at or above this value is reviewed",
+    )
+    parser.add_argument(
+        "--semantic-uncertainty-threshold",
+        type=float,
+        default=0.15,
+        help=(
+            "score dispersion (std of score_samples or explicit score_std) at or "
+            "above this value demotes a pass to review"
+        ),
+    )
+    parser.add_argument(
+        "--semantic-counterfactual-margin-threshold",
+        type=float,
+        default=0.10,
+        help=(
+            "details.counterfactual_margin below this value is reviewed: a "
+            "corrupted instruction scored nearly as well as the true one"
+        ),
+    )
+    parser.add_argument(
         "--task-profile-dir",
         type=Path,
         default=None,
@@ -1778,6 +1974,10 @@ def main() -> None:
                 motion_check=args.motion_check,
                 motion_gripper_index=args.motion_gripper_index,
                 motion_vertical_index=args.motion_vertical_index,
+                semantic_per_view=args.semantic_per_view,
+                semantic_view_disagreement_threshold=args.semantic_view_disagreement_threshold,
+                semantic_uncertainty_threshold=args.semantic_uncertainty_threshold,
+                semantic_counterfactual_margin_threshold=args.semantic_counterfactual_margin_threshold,
             )
         )
     raise SystemExit(
@@ -1799,6 +1999,10 @@ def main() -> None:
             motion_check=args.motion_check,
             motion_gripper_index=args.motion_gripper_index,
             motion_vertical_index=args.motion_vertical_index,
+            semantic_per_view=args.semantic_per_view,
+            semantic_view_disagreement_threshold=args.semantic_view_disagreement_threshold,
+            semantic_uncertainty_threshold=args.semantic_uncertainty_threshold,
+            semantic_counterfactual_margin_threshold=args.semantic_counterfactual_margin_threshold,
         )
     )
 

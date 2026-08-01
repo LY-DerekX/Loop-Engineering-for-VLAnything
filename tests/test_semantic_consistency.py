@@ -29,7 +29,7 @@ from utils.semantic_consistency import (
     vertical_direction_findings,
     vertical_excursions,
 )
-from utils.semantic_evaluator import EpisodeMotion
+from utils.semantic_evaluator import EpisodeMotion, SemanticResult, normalize_result
 from utils.task_semantic_profile import TaskSemanticProfile
 
 
@@ -392,7 +392,27 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def motion_dataset_info(total_episodes: int, total_frames: int) -> dict:
+WRIST_KEY = "observation.images.wrist"
+
+
+def motion_dataset_info(
+    total_episodes: int, total_frames: int, video_keys: tuple[str, ...] = (RGB_KEY,)
+) -> dict:
+    features = {
+        "action": {"dtype": "float32", "shape": [2]},
+        "observation.state": {"dtype": "float32", "shape": [2]},
+        "timestamp": {"dtype": "float32", "shape": [1]},
+        "frame_index": {"dtype": "int64", "shape": [1]},
+        "episode_index": {"dtype": "int64", "shape": [1]},
+        "index": {"dtype": "int64", "shape": [1]},
+        "task_index": {"dtype": "int64", "shape": [1]},
+    }
+    for video_key in video_keys:
+        features[video_key] = {
+            "dtype": "video",
+            "shape": [2, 2, 3],
+            "info": {"video.fps": 30, "video.codec": "h264"},
+        }
     return {
         "codebase_version": "v3.0",
         "fps": 30,
@@ -401,36 +421,38 @@ def motion_dataset_info(total_episodes: int, total_frames: int) -> dict:
         "total_frames": total_frames,
         "total_tasks": 1,
         "splits": {"train": f"0:{total_episodes}"},
-        "features": {
-            "action": {"dtype": "float32", "shape": [2]},
-            "observation.state": {"dtype": "float32", "shape": [2]},
-            "timestamp": {"dtype": "float32", "shape": [1]},
-            "frame_index": {"dtype": "int64", "shape": [1]},
-            "episode_index": {"dtype": "int64", "shape": [1]},
-            "index": {"dtype": "int64", "shape": [1]},
-            "task_index": {"dtype": "int64", "shape": [1]},
-            RGB_KEY: {
-                "dtype": "video",
-                "shape": [2, 2, 3],
-                "info": {"video.fps": 30, "video.codec": "h264"},
-            },
-        },
+        "features": features,
     }
 
 
 def write_motion_dataset(
-    root: Path, name: str, task: str, gripper_cycles: list[int], length: int = 60
+    root: Path,
+    name: str,
+    task: str,
+    gripper_cycles: list[int],
+    length: int = 60,
+    task_column: str = "task",
+    video_keys: tuple[str, ...] = (RGB_KEY,),
+    pack_files: bool = False,
 ) -> Path:
-    """Write a dataset whose second action dimension behaves like a gripper."""
+    """Write a dataset whose second action dimension behaves like a gripper.
+
+    `pack_files=True` reproduces the aggregated LeRobot v3 layout where every
+    episode shares one data parquet file instead of owning its own.
+    """
     dataset_root = root / name
-    write_json(dataset_root / "meta" / "info.json", motion_dataset_info(len(gripper_cycles), len(gripper_cycles) * length))
+    write_json(
+        dataset_root / "meta" / "info.json",
+        motion_dataset_info(len(gripper_cycles), len(gripper_cycles) * length, video_keys),
+    )
     write_json(dataset_root / "meta" / "stats.json", {})
     pq.write_table(
-        pa.table({"task_index": [0], "task": [task]}),
+        pa.table({"task_index": [0], task_column: [task]}),
         dataset_root / "meta" / "tasks.parquet",
     )
 
     rows = []
+    episode_tables = []
     global_from = 0
     for episode_index, cycles in enumerate(gripper_cycles):
         arm = np.linspace(0.0, 1.0, length)
@@ -451,29 +473,42 @@ def write_motion_dataset(
                 "task_index": [0] * length,
             }
         )
-        data_path = dataset_root / "data" / "chunk-000" / f"file-{episode_index:03d}.parquet"
-        data_path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, data_path)
+        if pack_files:
+            episode_tables.append(table)
+        else:
+            data_path = dataset_root / "data" / "chunk-000" / f"file-{episode_index:03d}.parquet"
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(table, data_path)
 
-        video_path = dataset_root / "videos" / RGB_KEY / "chunk-000" / f"file-{episode_index:03d}.mp4"
-        video_path.parent.mkdir(parents=True, exist_ok=True)
-        video_path.write_bytes(b"synthetic video placeholder")
-
-        rows.append(
-            {
-                "episode_index": episode_index,
-                "length": length,
-                "data/chunk_index": 0,
-                "data/file_index": episode_index,
-                "dataset_from_index": global_from,
-                "dataset_to_index": global_from + length,
-                f"videos/{RGB_KEY}/chunk_index": 0,
-                f"videos/{RGB_KEY}/file_index": episode_index,
-                f"videos/{RGB_KEY}/from_timestamp": 0.0,
-                f"videos/{RGB_KEY}/to_timestamp": length / 30.0,
-            }
-        )
+        row = {
+            "episode_index": episode_index,
+            "length": length,
+            "data/chunk_index": 0,
+            "data/file_index": 0 if pack_files else episode_index,
+            "dataset_from_index": global_from,
+            "dataset_to_index": global_from + length,
+        }
+        for video_key in video_keys:
+            video_path = (
+                dataset_root / "videos" / video_key / "chunk-000" / f"file-{episode_index:03d}.mp4"
+            )
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            video_path.write_bytes(b"synthetic video placeholder")
+            row.update(
+                {
+                    f"videos/{video_key}/chunk_index": 0,
+                    f"videos/{video_key}/file_index": episode_index,
+                    f"videos/{video_key}/from_timestamp": 0.0,
+                    f"videos/{video_key}/to_timestamp": length / 30.0,
+                }
+            )
+        rows.append(row)
         global_from += length
+
+    if pack_files:
+        data_path = dataset_root / "data" / "chunk-000" / "file-000.parquet"
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.concat_tables(episode_tables), data_path)
 
     episodes = pa.table({key: [row[key] for row in rows] for key in rows[0]})
     episode_path = dataset_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
@@ -738,6 +773,314 @@ class BoundaryAlignmentEnrichmentTests(unittest.TestCase):
             self.assertEqual(row["status"], "review")
             self.assertEqual(row["aligned"], 0)
             self.assertEqual(row["reasons"], ["language_subtask_boundary_unaligned_review"])
+
+
+class NormalizeResultContractTests(unittest.TestCase):
+    def test_samples_derive_the_missing_success_probability(self) -> None:
+        result = normalize_result({"score_samples": [0.90, 0.92, 0.94]})
+        self.assertAlmostEqual(result.success_probability, 0.92)
+        self.assertAlmostEqual(result.score, 0.92)
+        assert result.uncertainty is not None
+        self.assertLess(result.uncertainty, 0.05)
+
+    def test_explicit_success_probability_is_not_overwritten_by_samples(self) -> None:
+        result = normalize_result(
+            {"success_probability": 0.80, "score_samples": [0.10, 0.20]}
+        )
+        self.assertAlmostEqual(result.score, 0.80)
+
+    def test_sample_out_of_range_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_result({"success_probability": 0.9, "score_samples": [0.5, 1.5]})
+
+    def test_negative_score_std_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_result({"success_probability": 0.9, "score_std": -0.1})
+
+    def test_margin_out_of_range_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_result(
+                {"success_probability": 0.9, "details": {"counterfactual_margin": 1.5}}
+            )
+
+    def test_negative_margin_within_range_is_accepted(self) -> None:
+        result = normalize_result(
+            {"success_probability": 0.9, "details": {"counterfactual_margin": -0.2}}
+        )
+        self.assertAlmostEqual(result.counterfactual_margin, -0.2)
+
+    def test_explicit_std_wins_over_samples(self) -> None:
+        result = SemanticResult(
+            success_probability=0.9, score_samples=(0.1, 0.9), score_std=0.01
+        )
+        self.assertAlmostEqual(result.uncertainty, 0.01)
+
+    def test_single_sample_has_no_uncertainty(self) -> None:
+        result = normalize_result({"score_samples": [0.9]})
+        self.assertIsNone(result.uncertainty)
+
+
+class TaskTextColumnTests(unittest.TestCase):
+    """tasks.parquet written from a pandas frame stores text in __index_level_0__."""
+
+    def test_pandas_index_column_feeds_the_motion_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_motion_dataset(
+                root,
+                "pandas_tasks",
+                "Grab all the cups on the table then put them into the box",
+                gripper_cycles=[1, 0],
+                task_column="__index_level_0__",
+            )
+            summary, rows = run_motion_audit(dataset, root / "report")
+
+            motion = summary["semantic_consistency"]["motion"]
+            self.assertEqual(motion["verb_unmatched"], 0)
+            self.assertEqual(motion["episodes_checked"], 2)
+            self.assertEqual(rows[0]["semantic_motion_verbs"], "grasp;release")
+            self.assertNotIn(
+                "semantic_motion_gripper_pattern_review", rows[0]["review_reasons"]
+            )
+            self.assertIn(
+                "semantic_motion_gripper_pattern_review", rows[1]["review_reasons"]
+            )
+
+
+class AggregatedLayoutTests(unittest.TestCase):
+    """Recorded v3 datasets pack many episodes into one shared data file."""
+
+    def test_shared_data_file_is_sliced_per_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_motion_dataset(
+                root,
+                "packed",
+                "Grab all the cups on the table then put them into the box",
+                gripper_cycles=[1, 0, 1],
+                pack_files=True,
+            )
+            summary, rows = run_motion_audit(dataset, root / "report")
+
+            self.assertEqual(summary["drop"], 0)
+            for episode_index in (0, 1, 2):
+                self.assertEqual(rows[episode_index]["drop_reasons"], "")
+                self.assertEqual(int(rows[episode_index]["data_rows"]), 60)
+
+            # Per-episode slicing: only the cycle-free middle episode is flagged.
+            self.assertNotIn(
+                "semantic_motion_gripper_pattern_review", rows[0]["review_reasons"]
+            )
+            self.assertIn(
+                "semantic_motion_gripper_pattern_review", rows[1]["review_reasons"]
+            )
+            self.assertNotIn(
+                "semantic_motion_gripper_pattern_review", rows[2]["review_reasons"]
+            )
+            self.assertEqual(rows[1]["semantic_motion_gripper_transitions"], "0")
+            self.assertEqual(rows[0]["semantic_motion_gripper_transitions"], "2")
+
+    def test_semantic_reuse_slices_the_shared_file_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_motion_dataset(
+                root,
+                "packed_reuse",
+                "Grab all the cups on the table then put them into the box",
+                gripper_cycles=[1, 0],
+                pack_files=True,
+            )
+            report_dir = root / "report"
+            run_motion_audit(dataset, report_dir, motion_check="none")
+            audit_dataset_semantic_reuse(
+                root=dataset,
+                out_dir=report_dir,
+                semantic_evaluator=RetryCurveEvaluator(),
+            )
+            with (report_dir / "quality_report.csv").open(newline="", encoding="utf-8") as handle:
+                rows = {int(row["episode_index"]): row for row in csv.DictReader(handle)}
+            self.assertIn(
+                "semantic_motion_gripper_pattern_review", rows[1]["review_reasons"]
+            )
+            self.assertNotIn(
+                "semantic_motion_gripper_pattern_review", rows[0]["review_reasons"]
+            )
+
+
+class ConfigurableEvaluator:
+    """Returns a fixed verdict, optionally per-view, with contract extras."""
+
+    name = "configurable_test_evaluator"
+
+    def __init__(
+        self,
+        success: float = 0.95,
+        samples: tuple[float, ...] = (),
+        details: dict | None = None,
+        view_scores: dict[str, float] | None = None,
+    ) -> None:
+        self.success = success
+        self.samples = samples
+        self.details = details
+        self.view_scores = view_scores
+
+    def evaluate(self, episode):
+        if self.view_scores is not None and len(episode.videos) == 1:
+            return {"success_probability": self.view_scores[episode.videos[0].key]}
+        result: dict = {"success_probability": self.success}
+        if self.samples:
+            result["score_samples"] = list(self.samples)
+        if self.details is not None:
+            result["details"] = dict(self.details)
+        return result
+
+
+class ScoreReliabilityAuditTests(unittest.TestCase):
+    def run_reliability_audit(self, root: Path, evaluator, **kwargs):
+        dataset = write_motion_dataset(
+            root, "reliability", "pick up the cup and place it in the box", gripper_cycles=[1]
+        )
+        return run_motion_audit(
+            dataset, root / "report", semantic_evaluator=evaluator, **kwargs
+        )
+
+    def test_unstable_samples_demote_a_passing_score_to_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary, rows = self.run_reliability_audit(
+                Path(tmp), ConfigurableEvaluator(samples=(0.95, 0.50, 0.99, 0.45))
+            )
+            self.assertEqual(rows[0]["semantic_status"], "review")
+            self.assertIn("semantic_score_unstable_review", rows[0]["review_reasons"])
+            self.assertGreaterEqual(float(rows[0]["semantic_score_uncertainty"]), 0.15)
+            self.assertEqual(
+                summary["semantic_consistency"]["score_unstable_review"], 1
+            )
+
+    def test_stable_samples_keep_the_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary, rows = self.run_reliability_audit(
+                Path(tmp), ConfigurableEvaluator(samples=(0.94, 0.95, 0.96))
+            )
+            self.assertEqual(rows[0]["semantic_status"], "pass")
+            self.assertNotIn("semantic_score_unstable_review", rows[0]["review_reasons"])
+
+    def test_low_counterfactual_margin_is_reviewed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary, rows = self.run_reliability_audit(
+                Path(tmp),
+                ConfigurableEvaluator(details={"counterfactual_margin": 0.03}),
+            )
+            self.assertEqual(rows[0]["semantic_status"], "review")
+            self.assertIn(
+                "semantic_counterfactual_margin_low_review", rows[0]["review_reasons"]
+            )
+            self.assertAlmostEqual(
+                float(rows[0]["semantic_counterfactual_margin"]), 0.03
+            )
+            self.assertEqual(
+                summary["semantic_consistency"]["counterfactual_margin_low_review"], 1
+            )
+
+    def test_wide_margin_keeps_the_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, rows = self.run_reliability_audit(
+                Path(tmp),
+                ConfigurableEvaluator(details={"counterfactual_margin": 0.50}),
+            )
+            self.assertEqual(rows[0]["semantic_status"], "pass")
+            self.assertNotIn(
+                "semantic_counterfactual_margin_low_review", rows[0]["review_reasons"]
+            )
+
+    def test_backends_without_the_contracts_record_not_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, rows = self.run_reliability_audit(Path(tmp), ConfigurableEvaluator())
+            self.assertIn("semantic_score_stability_not_checked", rows[0]["not_checked"])
+            self.assertIn("semantic_counterfactual_not_checked", rows[0]["not_checked"])
+            self.assertEqual(rows[0]["semantic_status"], "pass")
+
+
+class PerViewAuditTests(unittest.TestCase):
+    def two_view_dataset(self, root: Path) -> Path:
+        return write_motion_dataset(
+            root,
+            "two_views",
+            "pick up the cup and place it in the box",
+            gripper_cycles=[1],
+            video_keys=(RGB_KEY, WRIST_KEY),
+        )
+
+    def test_disagreeing_views_are_reviewed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evaluator = ConfigurableEvaluator(
+                view_scores={RGB_KEY: 0.95, WRIST_KEY: 0.40}
+            )
+            summary, rows = run_motion_audit(
+                self.two_view_dataset(root),
+                root / "report",
+                semantic_evaluator=evaluator,
+                semantic_per_view=True,
+            )
+            self.assertEqual(rows[0]["semantic_status"], "review")
+            self.assertIn("semantic_view_disagreement_review", rows[0]["review_reasons"])
+            self.assertAlmostEqual(float(rows[0]["semantic_view_disagreement"]), 0.55)
+            metrics = json.loads(rows[0]["metrics_json"])
+            self.assertAlmostEqual(metrics["semantic_view_scores"][WRIST_KEY], 0.40)
+            self.assertEqual(
+                summary["semantic_consistency"]["view_disagreement_review"], 1
+            )
+            self.assertTrue(summary["semantic_evaluation"]["per_view"])
+
+    def test_agreeing_views_keep_the_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evaluator = ConfigurableEvaluator(
+                view_scores={RGB_KEY: 0.95, WRIST_KEY: 0.90}
+            )
+            _, rows = run_motion_audit(
+                self.two_view_dataset(root),
+                root / "report",
+                semantic_evaluator=evaluator,
+                semantic_per_view=True,
+            )
+            self.assertEqual(rows[0]["semantic_status"], "pass")
+            self.assertNotIn(
+                "semantic_view_disagreement_review", rows[0]["review_reasons"]
+            )
+            self.assertAlmostEqual(float(rows[0]["semantic_view_disagreement"]), 0.05)
+
+    def test_per_view_stays_off_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evaluator = ConfigurableEvaluator(
+                view_scores={RGB_KEY: 0.95, WRIST_KEY: 0.40}
+            )
+            _, rows = run_motion_audit(
+                self.two_view_dataset(root),
+                root / "report",
+                semantic_evaluator=evaluator,
+            )
+            self.assertEqual(rows[0]["semantic_view_disagreement"], "")
+            self.assertNotIn(
+                "semantic_view_disagreement_review", rows[0]["review_reasons"]
+            )
+
+    def test_single_view_records_a_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_motion_dataset(
+                root, "one_view", "pick up the cup and place it in the box", gripper_cycles=[1]
+            )
+            _, rows = run_motion_audit(
+                dataset,
+                root / "report",
+                semantic_evaluator=ConfigurableEvaluator(),
+                semantic_per_view=True,
+            )
+            self.assertIn(
+                "semantic_view_disagreement_single_view", rows[0]["not_checked"]
+            )
 
 
 if __name__ == "__main__":
