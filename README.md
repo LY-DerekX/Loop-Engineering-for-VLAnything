@@ -80,6 +80,7 @@ record/                 # framework-free recorder (no lerobot dependency):
                         #   visuo-tactile_record/ (vision + touch, in progress)
 tools/                  # local studios, depth visualization, structure-only checks
 utils/                  # shared audit, metadata, media, and semantic helpers
+semantic_backends/      # built-in --semantic-evaluator plugins (VLA checkpoint scoring)
 policy_improvement/     # feedback capture, intervention, and policy iteration contracts
 tests/                  # unit tests with synthetic datasets
 configs/                # example configuration files
@@ -109,6 +110,8 @@ Main capabilities:
 - audit RGB-only LeRobot datasets and RGB-D datasets with depth sidecars;
 - audit RGB videos, optional depth sidecars, action/state tables, metadata completeness, and deterministic quality failures;
 - parse detailed task descriptions into validated, editable semantic profiles;
+- score episodes with a trained VLA policy checkpoint through the built-in
+  action-consistency evaluator, including counterfactual instruction checks;
 - run the local Task Semantic Studio for profile review and semantic audit setup;
 - generate validated subtask, event, state, and summary language sidecars for approved trajectories;
 - collect human recovery/correction feedback with explicit action provenance;
@@ -377,6 +380,59 @@ dictionary.
 An evaluator also receives the episode's action and state arrays through
 `episode.motion`, so a backend can compare what the instruction says against
 what the arm actually did without re-reading parquet.
+
+### Built-in backend: score with a trained VLA checkpoint
+
+The toolkit ships one ready-to-use evaluator that turns a trained VLA policy
+checkpoint (a lerobot pretrained-policy directory such as pi05, smolvla, or
+act) into a data-quality scorer. A policy has no yes/no interface, so it is
+scored by **instruction-conditioned action consistency**: at sampled anchor
+frames the policy predicts a short action chunk from the camera frames, joint
+state, and task text, and the score measures how much better than a
+hold-position baseline the prediction matches the actions the demonstrator
+actually executed (1.0 reproduces the demonstration, 0.0 is no better than
+freezing). The same anchors are re-scored under deliberately corrupted
+instructions (reversed verb, swapped direction, color, or object) to fill
+`details.counterfactual_margin`: an episode whose actions are predicted
+equally well under a wrong instruction is not grounded in its language label
+and goes to review. Interleaved anchor subsets fill `score_samples`, so
+agreement that swings across the episode is demoted to review by the
+dispersion contract. No progress curve is returned, so the progress-shape and
+stage-order checks correctly report themselves as not-checked.
+
+~~~powershell
+python ./pipeline/data_quality_audit.py ./lerobot_derek_depth `
+  --semantic-evaluator semantic_backends.vla_checkpoint_evaluator:create_evaluator `
+  --semantic-config ./configs/vla_checkpoint_evaluator.example.json
+~~~
+
+The configuration names the checkpoint and the optional knobs
+([configs/vla_checkpoint_evaluator.example.json](configs/vla_checkpoint_evaluator.example.json)):
+
+~~~json
+{
+  "policy_path": "checkpoint for audit/pretrained_model",
+  "device": "cuda",
+  "anchors": 6,
+  "eval_horizon": 10,
+  "sample_splits": 3,
+  "max_counterfactuals": 3,
+  "camera_map": {"front": "head", "wrist": "right_wrist"}
+}
+~~~
+
+- `policy_path` is a lerobot pretrained-policy directory. Loading it needs the
+  policy runtime (`pip install lerobot` plus the policy's own extras), so run
+  this stage in the training environment — ideally as `--semantic-only` on top
+  of a structural report produced in the base environment.
+- `camera_map` renames dataset cameras to the names the policy was trained
+  with when they differ (for example `{"front": "head"}`).
+- The score means "this checkpoint can reproduce this demonstration". A low
+  score can also mean the episode is merely out-of-distribution for the
+  current policy, so calibrate the failure/pass thresholds on human-labelled
+  episodes before trusting automatic passes. `--semantic-per-view` is not
+  useful with this backend: the policy needs every camera it was trained with
+  inside one observation.
 
 Task text is resolved from `meta/tasks.parquet` whether the string lives in an
 explicit `task` column or in the pandas index artifact `__index_level_0__`, and

@@ -94,6 +94,25 @@ python .\pipeline\data_quality_audit.py .\lerobot_derek_depth `
 需要任务级匹配与阈值覆盖时加 `--task-profile-dir .\task_profiles`（Profile 用
 `python .\tools\task_semantic_studio.py` 制作）。
 
+内置后端：不写自定义插件时，可直接用仓库自带的 VLA checkpoint 动作一致性
+评估器，把训练好的策略目录（如 `checkpoint for audit\pretrained_model`）当
+数据质检器用:
+
+~~~powershell
+python .\pipeline\data_quality_audit.py .\lerobot_derek_depth `
+  --semantic-only `
+  --semantic-evaluator semantic_backends.vla_checkpoint_evaluator:create_evaluator `
+  --semantic-config .\configs\vla_checkpoint_evaluator.example.json
+~~~
+
+该后端在采样锚点让策略按（图像+关节状态+任务文本）预测动作块，与示教实际
+执行的动作对比打分（1.0 = 完全复现示教，0.0 = 不比保持不动好），并自动用
+"换错指令"（动词反转/方向/颜色/物体替换）重打分得到反事实边际——换错指令
+后预测同样好的 episode 说明其语言标签没有接地，进 review。注意：它需要策略
+运行时（`pip install lerobot` 及策略自身依赖），请在训练环境执行本阶段；
+低分也可能只是当前策略的分布外数据，阈值须在人工标注集上校准后再信任
+自动 pass。
+
 说明:
 
 - 默认复用 `<out-dir>\quality_report.csv`；要指定别的报告用
