@@ -27,3 +27,7 @@ Thumbs.db
 
 # Local data directory
 data/
+
+# Local model checkpoints (semantic-audit evaluator weights, policy checkpoints)
+checkpoint for audit/
+checkpoints/

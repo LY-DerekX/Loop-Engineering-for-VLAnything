@@ -20,9 +20,18 @@ import argparse
 import csv
 import hashlib
 import json
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+
+# Allow `python ./pipeline/data_quality_audit.py` to run as a plain script:
+# repo-root packages (utils, policy_improvement, semantic_backends) must be
+# importable, including semantic evaluator plugins loaded via module:attribute.
+if __package__ in (None, ""):
+    _REPO_ROOT = str(Path(__file__).resolve().parents[1])
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import pyarrow as pa
