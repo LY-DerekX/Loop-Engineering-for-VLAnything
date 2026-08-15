@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pyarrow as pa
@@ -16,6 +17,7 @@ import pyarrow.parquet as pq
 from pipeline.dataset_clean_build import build_clean_dataset
 from pipeline.data_quality_audit import audit_dataset, audit_dataset_semantic_reuse
 from pipeline.dataset_merge import merge_datasets
+from utils.dataset_metadata import EpisodeDataReader
 from utils.dataset_io import prepare_output_dir
 from utils.semantic_evaluator import load_evaluator
 from utils.task_semantic_profile import TaskProfileRegistry, TaskSemanticProfile
@@ -254,7 +256,294 @@ def write_rgb_dataset(root: Path, name: str, lengths: list[int], base_value: int
     return dataset_root
 
 
+def write_aggregated_rgb_dataset(root: Path, name: str) -> Path:
+    dataset_root = root / name
+    info = rgb_dataset_info(total_episodes=2, total_frames=5)
+    info["total_tasks"] = 2
+    write_json(dataset_root / "meta" / "info.json", info)
+    write_json(dataset_root / "meta" / "stats.json", {})
+    pq.write_table(
+        pa.table(
+            {
+                "task_index": [0, 1],
+                "task": ["discarded task", "kept task"],
+            }
+        ),
+        dataset_root / "meta" / "tasks.parquet",
+    )
+
+    table = pa.table(
+        {
+            "action": [
+                [10.0, 10.5],
+                [11.0, 11.5],
+                [100.0, 100.5],
+                [101.0, 101.5],
+                [102.0, 102.5],
+            ],
+            "observation.state": [
+                [11.0, 11.5],
+                [12.0, 12.5],
+                [101.0, 101.5],
+                [102.0, 102.5],
+                [103.0, 103.5],
+            ],
+            "timestamp": [0.0, 1 / 30, 0.0, 1 / 30, 2 / 30],
+            "frame_index": [0, 1, 0, 1, 2],
+            "episode_index": [0, 0, 1, 1, 1],
+            "index": [0, 1, 2, 3, 4],
+            "task_index": [0, 0, 1, 1, 1],
+        }
+    )
+    data_path = dataset_root / "data" / "chunk-000" / "file-007.parquet"
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, data_path)
+
+    write_placeholder_video(dataset_root, RGB_KEY, 0)
+    episode_rows = [
+        {
+            "episode_index": 0,
+            "length": 2,
+            "data/chunk_index": 0,
+            "data/file_index": 7,
+            "dataset_from_index": 0,
+            "dataset_to_index": 2,
+            f"videos/{RGB_KEY}/chunk_index": 0,
+            f"videos/{RGB_KEY}/file_index": 0,
+            f"videos/{RGB_KEY}/from_timestamp": 0.0,
+            f"videos/{RGB_KEY}/to_timestamp": 2 / 30,
+        },
+        {
+            "episode_index": 1,
+            "length": 3,
+            "data/chunk_index": 0,
+            "data/file_index": 7,
+            "dataset_from_index": 2,
+            "dataset_to_index": 5,
+            f"videos/{RGB_KEY}/chunk_index": 0,
+            f"videos/{RGB_KEY}/file_index": 0,
+            f"videos/{RGB_KEY}/from_timestamp": 2 / 30,
+            f"videos/{RGB_KEY}/to_timestamp": 5 / 30,
+        },
+    ]
+    episodes = pa.Table.from_pylist(episode_rows)
+    episode_path = dataset_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    episode_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(episodes, episode_path)
+    return dataset_root
+
+
 class LeRobotPipelineTests(unittest.TestCase):
+    def test_episode_data_reader_keeps_only_the_most_recent_shard_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_aggregated_rgb_dataset(root, "aggregated_dataset")
+            episodes = pq.read_table(
+                dataset / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+            ).to_pylist()
+            first_shard = dataset / "data" / "chunk-000" / "file-007.parquet"
+            second_shard = dataset / "data" / "chunk-000" / "file-008.parquet"
+            pq.write_table(pq.read_table(first_shard), second_shard)
+            second_shard_row = {**episodes[0], "data/file_index": 8}
+            reader = EpisodeDataReader(dataset)
+
+            with mock.patch("utils.dataset_metadata.pq.read_table", wraps=pq.read_table) as read_table:
+                reader.read_episode(episodes[0], columns=["task_index"])
+                reader.read_episode(episodes[1])
+                self.assertEqual(read_table.call_count, 1)
+
+                reader.read_episode(second_shard_row)
+                self.assertEqual(read_table.call_count, 2)
+
+                reader.read_episode(episodes[0])
+                self.assertEqual(read_table.call_count, 3)
+
+    def test_episode_data_reader_rejects_inconsistent_metadata_and_rows(self) -> None:
+        cases = [
+            ("length mismatch", "metadata length mismatch"),
+            ("index mismatch", "data index mismatch"),
+            ("identity mismatch", "data identity mismatch"),
+        ]
+        for case, expected_error in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                dataset = write_aggregated_rgb_dataset(root, "aggregated_dataset")
+                episode = pq.read_table(
+                    dataset / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+                ).to_pylist()[0]
+                data_path = dataset / "data" / "chunk-000" / "file-007.parquet"
+
+                if case == "length mismatch":
+                    episode["length"] = 3
+                else:
+                    data = pq.read_table(data_path)
+                    column_name = "index" if case == "index mismatch" else "episode_index"
+                    values = [0, 0, 2, 3, 4] if case == "index mismatch" else [1, 1, 1, 1, 1]
+                    column_no = data.schema.get_field_index(column_name)
+                    data = data.set_column(
+                        column_no,
+                        data.schema.field(column_no),
+                        pa.array(values, type=data.schema.field(column_no).type),
+                    )
+                    pq.write_table(data, data_path)
+
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    EpisodeDataReader(dataset).read_episode(episode)
+
+    def test_merge_rejects_multi_shard_episode_metadata_before_replacing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_aggregated_rgb_dataset(root, "aggregated_dataset")
+            first_metadata = dataset / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+            second_metadata = dataset / "meta" / "episodes" / "chunk-001" / "file-000.parquet"
+            second_metadata.parent.mkdir(parents=True)
+            pq.write_table(pq.read_table(first_metadata).slice(0, 1), second_metadata)
+
+            merged = root / "merged_dataset"
+            merged.mkdir()
+            marker = merged / "existing-output.txt"
+            marker.write_text("preserve me", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "requires one episode metadata shard"):
+                merge_datasets(
+                    src_root=root,
+                    out_dir=merged,
+                    overwrite=True,
+                    dataset_names=["aggregated_dataset"],
+                    copy_mode="copy",
+                )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me")
+
+    def test_merge_rejects_gapped_episode_ranges_before_replacing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_aggregated_rgb_dataset(root, "aggregated_dataset")
+            metadata_path = dataset / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+            metadata = pq.read_table(metadata_path)
+            columns = metadata.to_pydict()
+            columns["dataset_from_index"][1] = 10
+            columns["dataset_to_index"][1] = 13
+            pq.write_table(pa.Table.from_pydict(columns, schema=metadata.schema), metadata_path)
+
+            merged = root / "merged_dataset"
+            merged.mkdir()
+            marker = merged / "existing-output.txt"
+            marker.write_text("preserve me", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "ranges must start at zero and be contiguous"):
+                merge_datasets(
+                    src_root=root,
+                    out_dir=merged,
+                    overwrite=True,
+                    dataset_names=["aggregated_dataset"],
+                    copy_mode="copy",
+                )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me")
+
+    def test_clean_build_reads_only_the_kept_episode_from_a_shared_data_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_aggregated_rgb_dataset(root, "aggregated_dataset")
+            drop_list = root / "drop_episodes.txt"
+            drop_list.write_text("0\n", encoding="utf-8")
+            cleaned = root / "cleaned_dataset"
+
+            build_clean_dataset(
+                src_dataset=dataset,
+                out_dir=cleaned,
+                drop_list=drop_list,
+                overwrite=False,
+                video_mode="copy-referenced",
+                copy_mode="copy",
+                ffmpeg_path=None,
+                video_crf=30,
+                dry_run=False,
+            )
+
+            data = pq.read_table(cleaned / "data" / "chunk-000" / "file-000.parquet")
+            self.assertEqual(data.num_rows, 3)
+            self.assertEqual([row[0] for row in data["action"].to_pylist()], [100.0, 101.0, 102.0])
+            self.assertEqual(data["episode_index"].to_pylist(), [0, 0, 0])
+            self.assertEqual(data["index"].to_pylist(), [0, 1, 2])
+            self.assertEqual(data["task_index"].to_pylist(), [0, 0, 0])
+
+            tasks = pq.read_table(cleaned / "meta" / "tasks.parquet").to_pylist()
+            self.assertEqual(tasks, [{"task_index": 0, "task": "kept task"}])
+            episode = pq.read_table(
+                cleaned / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+            ).to_pylist()
+            self.assertEqual(
+                [(row["length"], row["dataset_from_index"], row["dataset_to_index"]) for row in episode],
+                [(3, 0, 3)],
+            )
+
+            info = json.loads((cleaned / "meta" / "info.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                (info["total_episodes"], info["total_frames"], info["total_tasks"]),
+                (1, 3, 1),
+            )
+            self.assertEqual(
+                info["data_path"],
+                "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+            )
+            self.assertEqual(
+                info["video_path"],
+                "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+            )
+
+    def test_merge_reads_episodes_through_shared_shard_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_aggregated_rgb_dataset(root, "aggregated_dataset")
+            merged = root / "merged_dataset"
+
+            merge_datasets(
+                src_root=root,
+                out_dir=merged,
+                overwrite=False,
+                dataset_names=["aggregated_dataset"],
+                copy_mode="copy",
+            )
+
+            first = pq.read_table(merged / "data" / "chunk-000" / "file-000.parquet")
+            second = pq.read_table(merged / "data" / "chunk-000" / "file-001.parquet")
+            self.assertEqual([row[0] for row in first["action"].to_pylist()], [10.0, 11.0])
+            self.assertEqual([row[0] for row in second["action"].to_pylist()], [100.0, 101.0, 102.0])
+            self.assertEqual(first["episode_index"].to_pylist(), [0, 0])
+            self.assertEqual(second["episode_index"].to_pylist(), [1, 1, 1])
+            self.assertEqual(first["index"].to_pylist() + second["index"].to_pylist(), list(range(5)))
+
+            episodes = pq.read_table(
+                merged / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+            ).to_pylist()
+            self.assertEqual(
+                [
+                    (
+                        row["episode_index"],
+                        row["length"],
+                        row["data/chunk_index"],
+                        row["data/file_index"],
+                        row["dataset_from_index"],
+                        row["dataset_to_index"],
+                    )
+                    for row in episodes
+                ],
+                [(0, 2, 0, 0, 0, 2), (1, 3, 0, 1, 2, 5)],
+            )
+
+            info = json.loads((merged / "meta" / "info.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                (info["total_episodes"], info["total_frames"], info["total_tasks"]),
+                (2, 5, 2),
+            )
+            self.assertEqual(
+                info["data_path"],
+                "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+            )
+            self.assertEqual(
+                info["video_path"],
+                "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+            )
     def test_overwrite_refuses_output_containing_source_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "workspace"
