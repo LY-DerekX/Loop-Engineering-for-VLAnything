@@ -396,6 +396,12 @@ def run_merge_paths(src_paths: list[Path], out_dir: Path, overwrite: bool, copy_
     out_resolved = out_dir.resolve() if out_dir.exists() else out_dir.absolute()
     if out_resolved in resolved_sources:
         raise ValueError("merge output must not overwrite a source dataset")
+    for source in resolved_sources:
+        try:
+            source.relative_to(out_resolved)
+        except ValueError:
+            continue
+        raise ValueError(f"merge output must not contain a source dataset: {source}")
     for path in resolved_sources:
         validate_merge_source_dataset(path)
 
