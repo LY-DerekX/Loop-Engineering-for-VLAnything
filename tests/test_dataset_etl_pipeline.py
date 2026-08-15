@@ -16,6 +16,7 @@ import pyarrow.parquet as pq
 from pipeline.dataset_clean_build import build_clean_dataset
 from pipeline.data_quality_audit import audit_dataset, audit_dataset_semantic_reuse
 from pipeline.dataset_merge import merge_datasets
+from utils.dataset_io import prepare_output_dir
 from utils.semantic_evaluator import load_evaluator
 from utils.task_semantic_profile import TaskProfileRegistry, TaskSemanticProfile
 
@@ -254,6 +255,45 @@ def write_rgb_dataset(root: Path, name: str, lengths: list[int], base_value: int
 
 
 class LeRobotPipelineTests(unittest.TestCase):
+    def test_overwrite_refuses_output_containing_source_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "workspace"
+            source = output / "source_dataset"
+            marker = source / "meta" / "info.json"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("{}", encoding="utf-8")
+
+            try:
+                with self.assertRaisesRegex(ValueError, "must not contain the source dataset"):
+                    prepare_output_dir(source, output, overwrite=True)
+            finally:
+                self.assertTrue(marker.exists(), "output preparation deleted its source dataset")
+
+    def test_merge_overwrite_refuses_output_containing_any_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "workspace"
+            source_names = ["a_dataset", "b_dataset"]
+            sources = [
+                write_dataset(output, name, [1], index * 100)
+                for index, name in enumerate(source_names)
+            ]
+            markers = [source / "meta" / "info.json" for source in sources]
+
+            try:
+                with self.assertRaisesRegex(ValueError, "must not contain a source dataset"):
+                    merge_datasets(
+                        src_root=output,
+                        out_dir=output,
+                        overwrite=True,
+                        dataset_names=source_names,
+                        copy_mode="copy",
+                    )
+            finally:
+                self.assertTrue(
+                    all(marker.exists() for marker in markers),
+                    "merge deleted a source dataset",
+                )
+
     def test_task_profile_controls_threshold_and_failure_stage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
