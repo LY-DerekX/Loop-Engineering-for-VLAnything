@@ -907,7 +907,7 @@ accidental persistence of credentials.
 
 ## Check Completeness
 
-Use `utils/dataset_completeness_check.py` for structure-only validation after merging or cleaning.
+Use `tools/dataset_completeness_check.py` for structure-only validation after merging or cleaning.
 
 ```powershell
 python ./tools/dataset_completeness_check.py .\lerobot_derek_depth
