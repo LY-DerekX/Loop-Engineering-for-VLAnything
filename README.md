@@ -72,8 +72,8 @@ Aligned episode overview matrices:
 The repository is organized by role:
 
 ```text
-pipeline/               # production entry points: merge, audit, clean, feedback build,
-                        #   language enrichment, policy iteration, HF upload
+pipeline/               # production entry points: merge, audit, clean, RGB export,
+                        #   feedback build, language enrichment, policy iteration, HF upload
 record/                 # framework-free recorder (no lerobot dependency):
                         #   recorder/ (self-contained library), camera_profiles.yaml/.py,
                         #   rgb_record/ (RGB-only), rgbd_record/ (Orbbec / RealSense RGB-D + feedback),
@@ -122,6 +122,8 @@ Main capabilities:
 - build a clean train-ready dataset from `drop_episodes.txt`;
 - profile task balance, episode lengths, and frame-level signal distributions
   into a written report;
+- export a pure-RGB LeRobot dataset from an RGB-D dataset for standard
+  RGB-only consumers;
 - upload the dataset to Hugging Face with resumable large-folder upload support;
 - visualize depth PNG files for inspection.
 
@@ -959,6 +961,22 @@ Notes:
 - `trim-reencode` trims videos per kept episode and physically removes dropped episode segments.
 - `copy-referenced` is faster, but copied mp4 files may still contain unreferenced old segments.
 - The output includes `cleaning_manifest.json`.
+
+## Export an RGB-Only Dataset
+
+Use `pipeline/dataset_export_rgb.py` to derive a pure-RGB LeRobot v3 dataset
+from an RGB-D dataset, for standard RGB-only consumers. The source is not
+modified. The embedded depth PNG columns are removed from the data parquets
+(read column-selectively, so depth bytes are never loaded), depth features are
+dropped from `info.json`, episode stats, and `stats.json`, and the
+`depth_sidecar/` directory and depth manifest are not copied. Videos and tasks
+are copied unchanged.
+
+```powershell
+python ./pipeline/dataset_export_rgb.py `
+  --src .\lerobot_derek_depth `
+  --out-dir .\lerobot_derek_rgb
+```
 
 ## Upload to Hugging Face
 
