@@ -4,6 +4,7 @@ import binascii
 import csv
 import json
 import struct
+import subprocess
 import tempfile
 import unittest
 import zlib
@@ -19,6 +20,7 @@ from pipeline.data_quality_audit import audit_dataset, audit_dataset_semantic_re
 from pipeline.dataset_merge import merge_datasets
 from utils.dataset_metadata import EpisodeDataReader
 from utils.dataset_io import prepare_output_dir
+from utils.media_utils import ffmpeg_available, sample_video_file, video_content_metrics
 from utils.semantic_evaluator import load_evaluator
 from utils.task_semantic_profile import TaskProfileRegistry, TaskSemanticProfile
 
@@ -881,6 +883,113 @@ class LeRobotPipelineTests(unittest.TestCase):
             self.assertEqual((report_dir / "drop_episodes.txt").read_text(encoding="utf-8").strip(), "")
             summary = json.loads((report_dir / "quality_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["depth_keys"], [])
+
+
+def write_pattern_then_black_video(path: Path, ffmpeg_path: str) -> None:
+    """Encode 1s of animated test pattern followed by 1s of black at 30 fps."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            ffmpeg_path,
+            "-hide_banner",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x48:rate=30:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:size=64x48:rate=30:duration=1",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1[v]",
+            "-map",
+            "[v]",
+            "-pix_fmt",
+            "yuv420p",
+            str(path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+
+@unittest.skipUnless(ffmpeg_available(), "ffmpeg is not available")
+class VideoContentSamplingTests(unittest.TestCase):
+    def test_strided_samples_span_the_video_instead_of_repeating_frame_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "moving.mp4"
+            write_pattern_then_black_video(video, ffmpeg_available())
+            frames, message = sample_video_file(video, ffmpeg_available(), sample_frames=6, stride=10)
+            self.assertIsNotNone(frames, message)
+            unique_frames = {frame.tobytes() for frame in frames}
+            self.assertGreater(len(unique_frames), 1)
+            metrics = video_content_metrics(frames)
+            self.assertLess(metrics["freeze_ratio"], 0.90)
+
+    def test_segment_sampling_isolates_each_episode_time_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "two_episodes.mp4"
+            write_pattern_then_black_video(video, ffmpeg_available())
+            pattern, message = sample_video_file(
+                video, ffmpeg_available(), sample_frames=4, stride=8, start=0.0, duration=1.0
+            )
+            self.assertIsNotNone(pattern, message)
+            self.assertLess(video_content_metrics(pattern)["black_ratio"], 0.5)
+            black, message = sample_video_file(
+                video, ffmpeg_available(), sample_frames=4, stride=8, start=1.0, duration=1.0
+            )
+            self.assertIsNotNone(black, message)
+            self.assertGreater(video_content_metrics(black)["black_ratio"], 0.95)
+
+    def test_shared_video_episodes_receive_independent_content_verdicts(self) -> None:
+        content_reviews = (
+            "video_file_black_high_review",
+            "video_file_white_high_review",
+            "video_file_near_constant_high_review",
+            "video_file_frozen_high_review",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = write_rgb_dataset(root, "shared_video_set", [30, 30], 10)
+
+            # Both episodes reference ONE real video: pattern second then black second.
+            video_dir = dataset / "videos" / RGB_KEY / "chunk-000"
+            (video_dir / "file-001.mp4").unlink()
+            write_pattern_then_black_video(video_dir / "file-000.mp4", ffmpeg_available())
+            episode_path = dataset / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+            rows = pq.read_table(episode_path).to_pylist()
+            for row in rows:
+                episode = int(row["episode_index"])
+                row[f"videos/{RGB_KEY}/file_index"] = 0
+                row[f"videos/{RGB_KEY}/from_timestamp"] = float(episode)
+                row[f"videos/{RGB_KEY}/to_timestamp"] = float(episode) + 1.0
+            pq.write_table(pa.table({key: [row[key] for row in rows] for key in rows[0]}), episode_path)
+
+            report_dir = root / "shared_video_report"
+            audit_dataset(
+                root=dataset,
+                out_dir=report_dir,
+                depth_check="none",
+                video_check="metadata",
+                video_content_check="sample",
+                sample_frames=4,
+                depth_sample_frames=0,
+                duplicate_check="none",
+                video_sample_stride=8,
+                motion_check="none",
+            )
+            with (report_dir / "quality_report.csv").open(encoding="utf-8") as handle:
+                reviews = {
+                    int(row["episode_index"]): row["review_reasons"].split(";")
+                    for row in csv.DictReader(handle)
+                }
+            for reason in content_reviews:
+                self.assertNotIn(f"{reason}:{RGB_KEY}", reviews[0])
+            self.assertIn(f"video_file_black_high_review:{RGB_KEY}", reviews[1])
 
 
 if __name__ == "__main__":
