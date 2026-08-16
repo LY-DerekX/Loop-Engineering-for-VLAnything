@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from pipeline.data_quality_audit import audit_dataset
-from pipeline.dataset_export_rgb import run_export
+from pipeline.rgbd_export_rgb import run_export
 from tools.dataset_distribution_report import Config as ReportConfig, run_report
 from tests.test_dataset_etl_pipeline import DEPTH_KEY, RGB_KEY, write_dataset, write_rgb_dataset
 

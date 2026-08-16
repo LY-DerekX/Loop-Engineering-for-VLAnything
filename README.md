@@ -964,7 +964,7 @@ Notes:
 
 ## Export an RGB-Only Dataset
 
-Use `pipeline/dataset_export_rgb.py` to derive a pure-RGB LeRobot v3 dataset
+Use `pipeline/rgbd_export_rgb.py` to derive a pure-RGB LeRobot v3 dataset
 from an RGB-D dataset, for standard RGB-only consumers. The source is not
 modified. The embedded depth PNG columns are removed from the data parquets
 (read column-selectively, so depth bytes are never loaded), depth features are
@@ -973,7 +973,7 @@ dropped from `info.json`, episode stats, and `stats.json`, and the
 are copied unchanged.
 
 ```powershell
-python ./pipeline/dataset_export_rgb.py `
+python ./pipeline/rgbd_export_rgb.py `
   --src .\lerobot_derek_depth `
   --out-dir .\lerobot_derek_rgb
 ```
