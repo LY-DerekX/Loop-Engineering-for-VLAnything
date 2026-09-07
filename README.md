@@ -85,7 +85,8 @@ record/                 # framework-free recorder (no lerobot dependency):
                         #   recorder/ (self-contained library), camera_profiles.yaml/.py,
                         #   rgb_record/ (RGB-only), rgbd_record/ (Orbbec / RealSense RGB-D + feedback),
                         #   visuo-tactile_record/ (vision + touch, in progress)
-tools/                  # local studios, depth visualization, structure-only checks
+tools/                  # local studios, depth visualization, structure-only checks,
+                        #   dataset distribution profiling
 utils/                  # shared audit, metadata, media, and semantic helpers
 semantic_backends/      # built-in --semantic-evaluator plugins (VLA checkpoint scoring)
 policy_improvement/     # feedback capture, intervention, and policy iteration contracts
@@ -128,6 +129,8 @@ Main capabilities:
 - run plugin-based train, evaluate, promote, and deploy policy iterations;
 - separate episodes into `keep`, `review`, and `drop` lists;
 - build a clean train-ready dataset from `drop_episodes.txt`;
+- profile task balance, episode lengths, and frame-level signal distributions
+  into a written report;
 - upload the dataset to Hugging Face with resumable large-folder upload support;
 - visualize depth PNG files for inspection.
 
@@ -921,6 +924,25 @@ Use `tools/dataset_completeness_check.py` for structure-only validation after me
 ```powershell
 python ./tools/dataset_completeness_check.py .\lerobot_derek_depth
 ```
+
+## Profile Data Distribution
+
+Use `tools/dataset_distribution_report.py` to profile what the dataset looks like
+for training, as opposed to whether it is broken (that is the audit's job): task
+balance (gini / entropy / top-k share), episode-length distribution and outliers,
+video packing, and — with `--scan frames` (the default) — exact frame-level
+distributions for action, state, per-step motion, tracking error, and timestamp
+spacing. The dataset is read only; videos are never decoded.
+
+```powershell
+python ./tools/dataset_distribution_report.py .\lerobot_derek_depth
+python ./tools/dataset_distribution_report.py .\lerobot_derek_depth --scan meta
+```
+
+The console report is accompanied by `distribution_summary.json`,
+`distribution_report.md`, `task_distribution.csv`, and
+`episode_distribution.csv` under `distribution_reports/<dataset_name>/`.
+Findings are advisory flags for a human to read, not pass/fail verdicts.
 
 ## Build a Clean Dataset
 
